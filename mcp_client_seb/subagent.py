@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .config import ServerConfig
 from .manager import MCPManager
@@ -43,6 +44,12 @@ SPAWN_TOOL_SCHEMA = {
             "type": "string",
             "description": "Optional initial system prompt steering the subagent's own LLM.",
         },
+        "config": {
+            "type": "string",
+            "description": "Optional path to a JSON config file with an 'mcpServers' object; "
+                           "the subagent connects to those servers at startup (it starts with "
+                           "no servers if omitted).",
+        },
     },
     "required": ["name"],
 }
@@ -61,8 +68,11 @@ class SpawnSettings:
     python: str = field(default_factory=lambda: sys.executable)
     serve_args: list[str] = field(default_factory=lambda: ["-m", "mcp_client_seb", "--serve"])
 
-    def config_for(self, name: str) -> ServerConfig:
-        return ServerConfig(name=name, command=self.python, args=list(self.serve_args))
+    def config_for(self, name: str, config: str | None = None) -> ServerConfig:
+        args = list(self.serve_args)
+        if config:
+            args += ["--config", config]
+        return ServerConfig(name=name, command=self.python, args=args)
 
 
 async def spawn_subagent(
@@ -70,8 +80,12 @@ async def spawn_subagent(
     name: str,
     settings: SpawnSettings,
     system_prompt: str | None = None,
+    config: str | None = None,
 ) -> tuple[list[dict[str, str]], bool]:
     """Launch a subagent and connect it. Returns ``(content_parts, is_error)``.
+
+    ``config`` is an optional path to a JSON config file (``mcpServers`` shape)
+    the subagent connects to at startup; without it the subagent starts empty.
 
     The return shape matches :meth:`MCPManager.call_tool` so this can back both
     the ``spawn_subagent`` local tool and the ``/spawn`` command directly.
@@ -81,7 +95,15 @@ async def spawn_subagent(
         return _err(f"invalid subagent name {name!r} "
                     "(use letters/digits/_/-, starting with a letter)")
 
-    cfg = settings.config_for(name)
+    if config:
+        # Validate + absolutize here so the error is clear, rather than letting
+        # the subagent process fail to start with a cryptic broken-pipe error.
+        path = Path(config).expanduser()
+        if not path.is_file():
+            return _err(f"config file not found: {path}")
+        config = str(path.resolve())
+
+    cfg = settings.config_for(name, config=config)
     try:
         new_tools = await manager.connect(cfg, prefix=name)
     except Exception as e:  # noqa: BLE001 — report, don't crash the caller
@@ -110,6 +132,7 @@ def install_spawn_tool(manager: MCPManager, settings: SpawnSettings) -> None:
             name=str(args.get("name", "")),
             settings=settings,
             system_prompt=args.get("system_prompt"),
+            config=args.get("config"),
         )
 
     manager.register_local_tool(

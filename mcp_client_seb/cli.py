@@ -49,8 +49,10 @@ HELP = f"""
   {c('/schema', 'cyan')} <tool>       print a tool's JSON input schema
   {c('/call', 'cyan')} <tool> [json]  call a tool directly, e.g.
                           /call file_info {{"path": "/bin/ls"}}
-  {c('/spawn', 'cyan')} <name>        launch a subagent (this project in server mode)
-                          and connect it; drive it via its <name>__ask tool
+  {c('/spawn', 'cyan')} <name> [-c cfg.json] [prompt]
+                          launch a subagent (this project in server mode) and
+                          connect it; -c gives it a config of MCP servers to
+                          start with. Drive it via its <name>__ask tool.
   {c('/thinking', 'cyan')}            toggle showing Claude's reasoning summary
   {c('/reset', 'cyan')}               start a fresh chat conversation
   {c('/quit', 'cyan')}                exit (also: /exit, Ctrl-D)
@@ -156,15 +158,23 @@ class Repl:
         print(parts_to_text(content))
 
     async def cmd_spawn(self, arg: str) -> None:
-        parts = arg.strip().split(maxsplit=1)
-        if not parts:
-            print(c("  Usage: /spawn <name> [system prompt]", "yellow"))
+        tokens = arg.strip().split()
+        if not tokens:
+            print(c("  Usage: /spawn <name> [-c <config.json>] [system prompt]", "yellow"))
             return
-        name = parts[0]
-        system_prompt = parts[1] if len(parts) > 1 else None
+        name = tokens[0]
+        rest = tokens[1:]
+        config = None
+        if rest and rest[0] in ("-c", "--config"):
+            if len(rest) < 2:
+                print(c("  Usage: /spawn <name> [-c <config.json>] [system prompt]", "yellow"))
+                return
+            config = rest[1]
+            rest = rest[2:]
+        system_prompt = " ".join(rest) if rest else None
         print(c(f"  → spawning subagent {name!r} …", "dim"))
         content, is_error = await spawn_subagent(
-            self.manager, name, self._spawn_settings, system_prompt)
+            self.manager, name, self._spawn_settings, system_prompt, config)
         print(c(parts_to_text(content), "red" if is_error else "green"))
 
     async def cmd_chat(self, text: str) -> None:
