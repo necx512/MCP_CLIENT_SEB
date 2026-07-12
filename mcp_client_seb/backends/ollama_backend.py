@@ -20,7 +20,6 @@ from typing import Any
 from .. import __version__
 from ..manager import MCPManager
 from .base import (
-    SYSTEM_PROMPT,
     BackendError,
     BackendUnavailable,
     BaseAgent,
@@ -115,7 +114,6 @@ class OllamaAgent(BaseAgent):
         self._think = think
         self._keep_alive = keep_alive
         super().__init__(manager)
-        self._tools = self._tool_specs()
         pulled = ollama_models(host, api_key)
         if pulled and not any(m == model or m.split(":")[0] == model for m in pulled):
             self.warning = (
@@ -152,7 +150,7 @@ class OllamaAgent(BaseAgent):
     # -- provider hooks ----------------------------------------------------
 
     def _initial_messages(self) -> list[dict[str, Any]]:
-        return [{"role": "system", "content": SYSTEM_PROMPT}]
+        return [{"role": "system", "content": self.system_prompt}]
 
     def _tool_specs(self) -> list[dict[str, Any]]:
         return [
@@ -177,8 +175,9 @@ class OllamaAgent(BaseAgent):
             payload["keep_alive"] = self._keep_alive
         if self._think is not None:
             payload["think"] = self._think  # False = skip the model's <think> phase (much faster)
-        if self._tools:
-            payload["tools"] = self._tools
+        tools = self._tool_specs()  # recomputed each turn (see AnthropicAgent._complete)
+        if tools:
+            payload["tools"] = tools
         try:
             resp = _post_json(f"{self._host}/api/chat", payload, CHAT_TIMEOUT, self._api_key)
         except urllib.error.URLError as e:

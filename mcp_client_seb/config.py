@@ -63,10 +63,14 @@ def load_servers(config_path: str | os.PathLike) -> dict[str, ServerConfig]:
 
     raw = json.loads(path.read_text())
     servers = raw.get("mcpServers")
-    if not isinstance(servers, dict) or not servers:
+    # An *empty* mcpServers object is allowed — that's a deliberate "no fixed
+    # servers" run (chat + /spawn still work). Only a missing/malformed key is
+    # an error.
+    if not isinstance(servers, dict):
         raise ValueError(
             f"{path} has no 'mcpServers' object — expected "
-            '{"mcpServers": {"<name>": {"command": "...", ...}}}'
+            '{"mcpServers": {"<name>": {"command": "...", ...}}}  '
+            '(use {"mcpServers": {}} for no servers)'
         )
 
     return {name: ServerConfig.from_dict(name, cfg) for name, cfg in servers.items()}

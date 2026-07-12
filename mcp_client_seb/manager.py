@@ -1,14 +1,22 @@
 """Connection manager for one or more MCP servers.
 
-Owns the lifetime of every stdio subprocess + ``ClientSession`` behind a single
-``AsyncExitStack``, aggregates their tools into one namespace, and dispatches
-tool calls to the right server. Everything here is async; the CLI drives it.
+Aggregates the tools of every connected MCP server into one namespace and
+dispatches tool calls to the right server. Everything here is async; the CLI
+drives it.
+
+Each server connection runs in its own dedicated asyncio task that opens the
+stdio subprocess + ``ClientSession`` with ``async with`` and then parks on a
+shutdown event. Opening and closing the connection in the *same* task is what
+lets :meth:`connect` be called safely from any task — including from inside an
+MCP request handler when we're running as a subagent (see
+:mod:`mcp_client_seb.server`) — without tripping anyio's cancel-scope rules.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from contextlib import AsyncExitStack
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,16 +27,27 @@ from .config import ServerConfig
 
 logger = logging.getLogger("mcp_client_seb.manager")
 
+#: A local tool handler: ``(arguments) -> (content_parts, is_error)``.
+#: ``content_parts`` is the same normalized list shape ``call_tool`` returns.
+LocalHandler = Callable[[dict[str, Any]], Awaitable[tuple[list[dict[str, Any]], bool]]]
+
 
 @dataclass
 class ToolRef:
-    """A tool exposed to the user, mapped back to its owning server."""
+    """A tool exposed to the user, mapped back to its owning server.
 
-    exposed_name: str      # unique name shown to the user / sent to Claude
-    server: str            # which server owns it
-    original_name: str     # the tool's real name on that server
+    Most tools are backed by an MCP server (``server`` set, ``handler`` None).
+    A *local* tool is implemented in-process by a Python coroutine (``handler``
+    set, ``server`` None) — this is how ``spawn_subagent`` is offered to the LLM
+    without any MCP server providing it.
+    """
+
+    exposed_name: str            # unique name shown to the user / sent to the LLM
+    server: str | None           # which server owns it (None for a local tool)
+    original_name: str           # the tool's real name on that server
     description: str
     input_schema: dict[str, Any]
+    handler: LocalHandler | None = None  # set for local tools; dispatched in-process
 
 
 class MCPManager:
@@ -36,10 +55,11 @@ class MCPManager:
 
     def __init__(self, servers: dict[str, ServerConfig]):
         self._servers = servers
-        self._stack = AsyncExitStack()
         self.sessions: dict[str, ClientSession] = {}
         self.tools: dict[str, ToolRef] = {}
         self.connect_errors: dict[str, str] = {}
+        self._conn_tasks: dict[str, asyncio.Task] = {}
+        self._shutdown: dict[str, asyncio.Event] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -51,35 +71,80 @@ class MCPManager:
         await self.aclose()
 
     async def connect_all(self) -> None:
-        for name, cfg in self._servers.items():
+        for name, cfg in list(self._servers.items()):
             try:
-                await self._connect(cfg)
+                await self.connect(cfg)
             except Exception as e:  # noqa: BLE001 — surface, don't crash the REPL
                 self.connect_errors[name] = f"{type(e).__name__}: {e}"
                 logger.warning("Failed to connect to %s: %s", name, e)
 
-    async def _connect(self, cfg: ServerConfig) -> None:
-        params = StdioServerParameters(
-            command=cfg.command,
-            args=cfg.args,
-            env=cfg.merged_env(),
-            cwd=cfg.cwd,
-        )
-        read, write = await self._stack.enter_async_context(stdio_client(params))
-        session = await self._stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
-        self.sessions[cfg.name] = session
-        await self._register_tools(cfg.name, session)
+    async def connect(self, cfg: ServerConfig, prefix: str | None = None) -> list[str]:
+        """Connect to a new MCP server at runtime and register its tools.
+
+        Unlike :meth:`connect_all` this raises on failure (so the caller — e.g.
+        the ``spawn_subagent`` tool — can report it) and returns the list of
+        newly-exposed tool names. ``prefix`` forces every tool from this server
+        to be namespaced ``<prefix>__<tool>`` (used for subagents so each one's
+        ``ask``/``connect_server``/… stay distinct and predictable).
+        """
+        if cfg.name in self.sessions or cfg.name in self._conn_tasks:
+            raise ValueError(f"a server named {cfg.name!r} is already connected")
+        before = set(self.tools)
+        ready: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._shutdown[cfg.name] = asyncio.Event()
+        self._conn_tasks[cfg.name] = asyncio.ensure_future(
+            self._run_connection(cfg, prefix, ready))
+        try:
+            await ready  # resolves once the session is initialized (or raises)
+        except Exception:
+            # Startup failed; tear down the bookkeeping so the name can be reused.
+            self._conn_tasks.pop(cfg.name, None)
+            self._shutdown.pop(cfg.name, None)
+            raise
+        self._servers.setdefault(cfg.name, cfg)
+        self.connect_errors.pop(cfg.name, None)
         logger.info("Connected to %s (%d tools)", cfg.name,
                     sum(1 for t in self.tools.values() if t.server == cfg.name))
+        return [name for name in self.tools if name not in before]
 
-    async def _register_tools(self, server: str, session: ClientSession) -> None:
+    async def _run_connection(self, cfg: ServerConfig, prefix: str | None,
+                              ready: asyncio.Future) -> None:
+        """Own one server connection for its whole life, in a single task.
+
+        Opens the subprocess + session, registers its tools, signals ``ready``,
+        then parks until :meth:`aclose` sets the shutdown event — at which point
+        the ``async with`` blocks unwind here, in this same task.
+        """
+        params = StdioServerParameters(
+            command=cfg.command, args=cfg.args, env=cfg.merged_env(), cwd=cfg.cwd)
+        try:
+            async with stdio_client(params) as (read, write), \
+                    ClientSession(read, write) as session:
+                await session.initialize()
+                self.sessions[cfg.name] = session
+                await self._register_tools(cfg.name, session, prefix=prefix)
+                if not ready.done():
+                    ready.set_result(None)
+                await self._shutdown[cfg.name].wait()
+        except Exception as e:  # noqa: BLE001
+            if not ready.done():
+                ready.set_exception(e)  # surface startup failure to connect()
+            else:
+                logger.warning("Connection to %s dropped: %s", cfg.name, e)
+        finally:
+            self.sessions.pop(cfg.name, None)
+
+    async def _register_tools(self, server: str, session: ClientSession,
+                              prefix: str | None = None) -> None:
         result = await session.list_tools()
         for tool in result.tools:
-            exposed = tool.name
-            # Namespace on collision so two servers can both expose e.g. "read".
-            if exposed in self.tools:
-                exposed = f"{server}__{tool.name}"
+            if prefix:
+                exposed = f"{prefix}__{tool.name}"
+            else:
+                exposed = tool.name
+                # Namespace on collision so two servers can both expose e.g. "read".
+                if exposed in self.tools:
+                    exposed = f"{server}__{tool.name}"
             self.tools[exposed] = ToolRef(
                 exposed_name=exposed,
                 server=server,
@@ -88,8 +153,31 @@ class MCPManager:
                 input_schema=tool.inputSchema or {"type": "object", "properties": {}},
             )
 
+    def register_local_tool(self, name: str, description: str,
+                            input_schema: dict[str, Any], handler: LocalHandler) -> None:
+        """Register an in-process tool, dispatched to ``handler`` (not a server).
+
+        Appears in the tool namespace alongside MCP tools — the LLM and ``/call``
+        treat it identically. Used to expose ``spawn_subagent``.
+        """
+        self.tools[name] = ToolRef(
+            exposed_name=name,
+            server=None,
+            original_name=name,
+            description=description,
+            input_schema=input_schema,
+            handler=handler,
+        )
+
     async def aclose(self) -> None:
-        await self._stack.aclose()
+        """Signal every connection task to unwind, then wait for them all."""
+        for event in self._shutdown.values():
+            event.set()
+        tasks = list(self._conn_tasks.values())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._conn_tasks.clear()
+        self._shutdown.clear()
 
     # -- dispatch ----------------------------------------------------------
 
@@ -105,6 +193,13 @@ class MCPManager:
         ref = self.tools.get(exposed_name)
         if ref is None:
             return [{"type": "text", "text": f"Unknown tool: {exposed_name!r}"}], True
+
+        if ref.handler is not None:  # local (in-process) tool
+            try:
+                return await ref.handler(arguments or {})
+            except Exception as e:  # noqa: BLE001
+                return [{"type": "text",
+                         "text": f"Local tool raised {type(e).__name__}: {e}"}], True
 
         session = self.sessions[ref.server]
         try:

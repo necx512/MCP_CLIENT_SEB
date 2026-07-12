@@ -22,10 +22,12 @@ implementations.
 from __future__ import annotations
 
 import asyncio
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..convlog import ConversationLog
 from ..manager import MCPManager, ToolRef, parts_to_text
 
 SYSTEM_PROMPT = (
@@ -88,7 +90,12 @@ class BaseAgent(ABC):
         self._manager = manager
         self.show_thinking = False
         self.warning: str | None = None
+        #: Mutable so a subagent's ``set_system_prompt`` tool can re-steer it.
+        self.system_prompt = SYSTEM_PROMPT
         self._messages: list[Any] = []
+        #: Full LLM transcript for this process → /tmp/<pid>.log.
+        self.log = ConversationLog()
+        self._logged_sig: Any = None  # last (system_prompt, tool-names) written
         self.reset()
 
     # -- construction / identity (subclass) --------------------------------
@@ -140,6 +147,38 @@ class BaseAgent(ABC):
         """Start a fresh conversation."""
         self._messages = self._initial_messages()
 
+    # -- conversation logging (shared) -------------------------------------
+
+    def _log_context(self) -> None:
+        """Log the system prompt + tools, but only when they've changed."""
+        refs = self._tool_refs()
+        sig = (self.system_prompt, tuple(sorted(t.exposed_name for t in refs)))
+        if sig == self._logged_sig:
+            return
+        self._logged_sig = sig
+        self.log.entry("SYSTEM PROMPT", self.system_prompt)
+        if refs:
+            lines = []
+            for t in refs:
+                summary = t.description.strip().splitlines()[0] if t.description.strip() else ""
+                lines.append(f"- {t.exposed_name}: {summary}")
+                lines.append(f"    input_schema: {json.dumps(t.input_schema)}")
+            self.log.entry(f"TOOLS ({len(refs)})", "\n".join(lines))
+        else:
+            self.log.entry("TOOLS (0)", "(none)")
+
+    def _log_assistant(self, turn: "Turn") -> None:
+        parts: list[str] = []
+        if turn.thinking:
+            parts.append(f"[reasoning]\n{turn.thinking}")
+        if turn.text:
+            parts.append(turn.text)
+        for call in turn.tool_calls:
+            parts.append(f"[tool_call] {call.name}({json.dumps(call.arguments)})")
+        if turn.refused:
+            parts.append(f"[refused] {turn.refusal_message}")
+        self.log.entry("ASSISTANT", "\n".join(parts) if parts else "(empty)")
+
     # -- the loop (shared across every backend) ----------------------------
 
     async def send(self, user_text: str, on_event) -> None:
@@ -148,14 +187,19 @@ class BaseAgent(ABC):
         ``on_event(kind, payload)`` kinds:
         {"thinking", "text", "tool_call", "tool_result", "error"}.
         """
+        self._log_context()
+        self.log.entry("USER", user_text)
         self._add_user(user_text)
 
         for _ in range(MAX_TOOL_ITERATIONS):
             try:
                 turn = await asyncio.to_thread(self._complete)
             except BackendError as e:
+                self.log.entry("ERROR", str(e))
                 on_event("error", str(e))
                 return
+
+            self._log_assistant(turn)
 
             if turn.refused:
                 on_event("error", turn.refusal_message or "The model declined to respond.")
@@ -174,9 +218,13 @@ class BaseAgent(ABC):
             for call in turn.tool_calls:
                 on_event("tool_call", {"name": call.name, "input": call.arguments})
                 content, is_error = await self._manager.call_tool(call.name, call.arguments)
+                text = parts_to_text(content)
+                self.log.entry(
+                    f"TOOL RESULT [{'error' if is_error else 'ok'}] {call.name}", text)
                 on_event("tool_result",
-                         {"name": call.name, "text": parts_to_text(content), "is_error": is_error})
+                         {"name": call.name, "text": text, "is_error": is_error})
                 results.append((call, content, is_error))
             self._record_tool_results(results)
 
+        self.log.entry("ERROR", f"Stopped after {MAX_TOOL_ITERATIONS} tool iterations.")
         on_event("error", f"Stopped after {MAX_TOOL_ITERATIONS} tool iterations.")

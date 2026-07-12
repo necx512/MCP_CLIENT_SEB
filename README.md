@@ -29,6 +29,7 @@ It comes pre-wired to the **`re-assistant`** reverse-engineering MCP server in
 10. [Configuration options](#10-configuration-options)
 11. [Troubleshooting](#11-troubleshooting)
 12. [How it works](#12-how-it-works)
+13. [Subagents (spawning and controlling instances)](#13-subagents-spawning-and-controlling-instances)
 
 ---
 
@@ -216,6 +217,7 @@ with a message (and manual `/call` still works).
 | `/tools [filter]` | List tools. Optional `filter` matches name or description. |
 | `/schema <tool>` | Print a tool's JSON input schema (so you know what args to pass). |
 | `/call <tool> [json]` | Call a tool directly. `json` is its arguments; omit for none. |
+| `/spawn <name> [prompt]` | Launch a **subagent** (this project in server mode) and connect it dynamically. Drive it via its `<name>__ask` tool. See [§13](#13-subagents-spawning-and-controlling-instances). |
 | `/thinking` | Toggle showing Claude's reasoning summary in chat mode. |
 | `/reset` | Clear the chat conversation and start fresh. |
 | `/quit` | Exit. Also `/exit`, `/q`, or Ctrl-D. |
@@ -457,15 +459,85 @@ MCP_CLIENT_SEB/
 ├── README.md                       # this file
 └── mcp_client_seb/
     ├── __main__.py                 # python -m mcp_client_seb
-    ├── cli.py                      # REPL + backend selection
-    ├── manager.py                  # MCPManager (provider-neutral)
+    ├── cli.py                      # REPL + backend selection + /spawn
+    ├── manager.py                  # MCPManager (provider-neutral, dynamic connect)
     ├── config.py                   # config parsing
+    ├── server.py                   # --serve: expose this client AS an MCP server
+    ├── subagent.py                 # spawn_subagent tool + /spawn helper
     └── backends/
         ├── __init__.py             # BACKENDS registry + build_agent()
         ├── base.py                 # BaseAgent: shared tool-use loop
         ├── anthropic_backend.py    # Claude backend
         └── ollama_backend.py       # Ollama backend
 ```
+
+---
+
+## 13. Subagents (spawning and controlling instances)
+
+This client is **both an MCP client and an MCP server**. As a client it consumes
+tools from MCP servers (everything above). As a server it can *be* a tool for
+another instance of itself — a **subagent** that a parent instance spawns and
+controls. An agent driving a subagent driving a sub-subagent, and so on.
+
+### The idea
+
+* A subagent is just `python -m mcp_client_seb --serve`: instead of a REPL it
+  speaks MCP over stdio.
+* It is **never put in `servers.json`.** The parent launches it and connects to
+  it **dynamically at runtime** — that is the whole point. (`servers.json` is
+  for your fixed, always-on tool servers.)
+* A subagent is a *full agent*: it has its own LLM and its own (initially empty)
+  set of MCP servers, which you add on the fly.
+
+### The tools a subagent exposes
+
+Once connected as `worker`, these appear in the parent's tool namespace:
+
+| Tool | What it does |
+|---|---|
+| `worker__ask(prompt)` | Delegate a task. The subagent reasons with its **own** LLM and tools, then returns its answer. |
+| `worker__connect_server(name, command, args, env, cwd)` | Give the subagent a new MCP server — **dynamic configuration**. |
+| `worker__set_system_prompt(text)` | Re-steer the subagent's LLM. |
+| `worker__list_tools()` | List the tools the subagent currently has. |
+| `worker__reset()` | Start the subagent on a fresh conversation. |
+
+### Two ways to spawn
+
+**From the REPL** (human-driven):
+
+```
+mcp> /spawn worker You are a focused web-research subagent.
+  → spawning subagent 'worker' …
+Spawned subagent 'worker'. New tools:
+  - worker__ask
+  - worker__connect_server
+  - worker__set_system_prompt
+  - worker__list_tools
+  - worker__reset
+Delegate work with worker__ask.
+
+mcp> /call worker__connect_server {"name": "web", "command": "python3", "args": ["-m", "some_web_server"]}
+mcp> /call worker__ask {"prompt": "Summarize example.com"}
+```
+
+**From chat** (LLM-driven): the parent's model is given a built-in
+`spawn_subagent` tool, so it can create and orchestrate subagents itself — spawn
+a worker, give it servers via `worker__connect_server`, then delegate with
+`worker__ask` — all within one conversation.
+
+### Notes
+
+* Subagents inherit the parent's **backend choice** (`--backend`, `--model`, …)
+  so they use the same LLM. API keys flow through the **environment**, not the
+  command line.
+* From Python you can drive this directly:
+  `await manager.connect(cfg, prefix="worker")` connects any MCP server at
+  runtime; `spawn_subagent(manager, "worker", SpawnSettings())` wraps the launch.
+* Subagent processes are children of the parent and are shut down cleanly when
+  the parent exits.
+
+---
 
 # INSTALLING OLLAMA
 - `curl -fsSL https://ollama.com/install.sh | sh`

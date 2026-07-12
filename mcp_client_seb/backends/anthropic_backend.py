@@ -12,7 +12,6 @@ from typing import Any
 
 from ..manager import MCPManager
 from .base import (
-    SYSTEM_PROMPT,
     BackendError,
     BackendUnavailable,
     BaseAgent,
@@ -31,7 +30,6 @@ class AnthropicAgent(BaseAgent):
     def __init__(self, manager: MCPManager, client: Any):
         super().__init__(manager)
         self._client = client
-        self._tools = self._tool_specs()
 
     # -- construction / identity -------------------------------------------
 
@@ -66,12 +64,14 @@ class AnthropicAgent(BaseAgent):
 
     def _complete(self) -> Turn:
         try:
+            # Recomputed each turn so tools added mid-conversation (e.g. a freshly
+            # spawned subagent's tools) are offered on the very next model call.
             response = self._client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
+                system=self.system_prompt,
                 thinking={"type": "adaptive", "display": "summarized"},
-                tools=self._tools,
+                tools=self._tool_specs(),
                 messages=self._messages,
             )
         except Exception as e:  # noqa: BLE001 — surface SDK/network errors to the loop

@@ -23,6 +23,7 @@ from . import __version__
 from .backends import BackendUnavailable, BaseAgent, ChatSettings, build_agent
 from .config import default_config_path, load_servers
 from .manager import MCPManager, parts_to_text
+from .subagent import SpawnSettings, install_spawn_tool, spawn_subagent
 
 # -- tiny ANSI helpers (no third-party deps) -------------------------------
 
@@ -48,6 +49,8 @@ HELP = f"""
   {c('/schema', 'cyan')} <tool>       print a tool's JSON input schema
   {c('/call', 'cyan')} <tool> [json]  call a tool directly, e.g.
                           /call file_info {{"path": "/bin/ls"}}
+  {c('/spawn', 'cyan')} <name>        launch a subagent (this project in server mode)
+                          and connect it; drive it via its <name>__ask tool
   {c('/thinking', 'cyan')}            toggle showing Claude's reasoning summary
   {c('/reset', 'cyan')}               start a fresh chat conversation
   {c('/quit', 'cyan')}                exit (also: /exit, Ctrl-D)
@@ -67,6 +70,7 @@ class Repl:
         api_key: str | None = None,
         think: bool | None = None,
         keep_alive: str | None = None,
+        spawn_settings: SpawnSettings | None = None,
     ):
         self.manager = manager
         self.agent: BaseAgent | None = None
@@ -79,6 +83,9 @@ class Repl:
         self._api_key = api_key
         self._think = think
         self._keep_alive = keep_alive
+        self._spawn_settings = spawn_settings or SpawnSettings()
+        # Offer spawn_subagent to the LLM as a local tool (mirrors /spawn).
+        install_spawn_tool(self.manager, self._spawn_settings)
         self._init_agent()
 
     def _init_agent(self) -> None:
@@ -114,7 +121,8 @@ class Repl:
             if flt and flt not in t.exposed_name.lower() and flt not in t.description.lower():
                 continue
             summary = t.description.strip().splitlines()[0] if t.description.strip() else ""
-            print(f"  {c(t.exposed_name, 'cyan')} {c('(' + t.server + ')', 'dim')}")
+            origin = t.server or "local"
+            print(f"  {c(t.exposed_name, 'cyan')} {c('(' + origin + ')', 'dim')}")
             if summary:
                 print(f"      {summary}")
             shown += 1
@@ -146,6 +154,18 @@ class Repl:
         style = "red" if is_error else "green"
         print(c(f"  [{'error' if is_error else 'ok'}]", style))
         print(parts_to_text(content))
+
+    async def cmd_spawn(self, arg: str) -> None:
+        parts = arg.strip().split(maxsplit=1)
+        if not parts:
+            print(c("  Usage: /spawn <name> [system prompt]", "yellow"))
+            return
+        name = parts[0]
+        system_prompt = parts[1] if len(parts) > 1 else None
+        print(c(f"  → spawning subagent {name!r} …", "dim"))
+        content, is_error = await spawn_subagent(
+            self.manager, name, self._spawn_settings, system_prompt)
+        print(c(parts_to_text(content), "red" if is_error else "green"))
 
     async def cmd_chat(self, text: str) -> None:
         if self.agent is None:
@@ -218,6 +238,8 @@ class Repl:
             self.cmd_schema(arg)
         elif cmd == "call":
             await self.cmd_call(arg)
+        elif cmd == "spawn":
+            await self.cmd_spawn(arg)
         elif cmd == "thinking":
             self.show_thinking = not self.show_thinking
             print(c(f"  show reasoning: {self.show_thinking}", "dim"))
@@ -236,9 +258,17 @@ async def _amain(argv: list[str] | None = None) -> int:
         description="A custom MCP client: manual tool REPL + Claude agent loop.",
     )
     parser.add_argument(
-        "--config", "-c", default=str(default_config_path()),
+        "--config", "-c", default=None,
         help="Path to a config file with an 'mcpServers' object "
-             "(default: servers.json next to the package).",
+             "(default: servers.json next to the package). In --serve mode, "
+             "omitting this starts the subagent with no servers (add them "
+             "dynamically via its connect_server tool).",
+    )
+    parser.add_argument(
+        "--serve", action="store_true",
+        help="Run as an MCP server over stdio (a controllable subagent) instead "
+             "of the interactive REPL. Normally launched for you by /spawn or the "
+             "spawn_subagent tool, not run by hand.",
     )
     parser.add_argument(
         "--backend", "-b", choices=["auto", "anthropic", "ollama"], default="auto",
@@ -278,23 +308,60 @@ async def _amain(argv: list[str] | None = None) -> int:
         format="%(name)s | %(levelname)s | %(message)s",
     )
 
+    think = {"on": True, "off": False}.get(args.ollama_think)  # "auto" -> None
+    settings = ChatSettings(model=args.model, host=args.ollama_host,
+                            api_key=args.ollama_api_key, think=think,
+                            keep_alive=args.ollama_keep_alive)
+    # How subagents are launched: same interpreter + backend choice, no --config
+    # (they start empty and are configured dynamically). Keys flow via env.
+    spawn_settings = SpawnSettings(serve_args=_serve_arg_tail(args))
+
+    if args.serve:
+        # MCP server mode: no stdout chatter (the protocol owns stdout).
+        from .server import serve  # noqa: PLC0415 — pulls in FastMCP only when serving
+        return await serve(config_path=args.config, backend=args.backend,
+                           settings=settings, spawn_settings=spawn_settings)
+
+    config = args.config or str(default_config_path())
     try:
-        servers = load_servers(args.config)
+        servers = load_servers(config)
     except (FileNotFoundError, ValueError) as e:
         print(c(f"Config error: {e}", "red"), file=sys.stderr)
         return 2
 
-    print(c(f"Connecting to {len(servers)} MCP server(s) from {args.config} …", "dim"))
+    print(c(f"Connecting to {len(servers)} MCP server(s) from {config} …", "dim"))
     async with MCPManager(servers) as manager:
         if not manager.sessions:
-            print(c("No servers connected. Check /servers output and your config.", "red"))
-        think = {"on": True, "off": False}.get(args.ollama_think)  # "auto" -> None
+            if servers:
+                print(c("No servers connected. Check /servers output and your config.", "red"))
+            else:
+                print(c("No MCP servers configured — chat and /spawn still work.", "dim"))
         repl = Repl(manager, backend=args.backend, model=args.model,
                     host=args.ollama_host, api_key=args.ollama_api_key,
-                    think=think, keep_alive=args.ollama_keep_alive)
+                    think=think, keep_alive=args.ollama_keep_alive,
+                    spawn_settings=spawn_settings)
         await repl.run()
     print(c("bye.", "dim"))
     return 0
+
+
+def _serve_arg_tail(args) -> list[str]:
+    """Argv (after the interpreter) used to launch a subagent in server mode.
+
+    Forwards the parent's backend selection so subagents use the same LLM, but
+    deliberately omits ``--config`` — subagents start empty and are wired up
+    dynamically. API keys are inherited from the environment, not passed here.
+    """
+    tail = ["-m", "mcp_client_seb", "--serve", "--backend", args.backend]
+    if args.model:
+        tail += ["--model", args.model]
+    if args.ollama_host:
+        tail += ["--ollama-host", args.ollama_host]
+    if args.ollama_think and args.ollama_think != "auto":
+        tail += ["--ollama-think", args.ollama_think]
+    if args.ollama_keep_alive:
+        tail += ["--ollama-keep-alive", args.ollama_keep_alive]
+    return tail
 
 
 def main(argv: list[str] | None = None) -> int:
