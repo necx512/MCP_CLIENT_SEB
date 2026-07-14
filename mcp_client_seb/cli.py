@@ -21,9 +21,9 @@ import sys
 
 from . import __version__
 from .backends import BackendUnavailable, BaseAgent, ChatSettings, build_agent
-from .config import default_config_path, load_servers
+from .config import default_config_path, load_config
 from .manager import MCPManager, parts_to_text
-from .subagent import SpawnSettings, install_spawn_tool, spawn_subagent
+from .subagent import SpawnSettings, install_spawn_tool, remove_subagent, spawn_subagent
 
 # -- tiny ANSI helpers (no third-party deps) -------------------------------
 
@@ -53,6 +53,7 @@ HELP = f"""
                           launch a subagent (this project in server mode) and
                           connect it; -c gives it a config of MCP servers to
                           start with. Drive it via its <name>__ask tool.
+  {c('/kill', 'cyan')} <name>         stop a spawned subagent and drop its tools
   {c('/thinking', 'cyan')}            toggle showing Claude's reasoning summary
   {c('/reset', 'cyan')}               start a fresh chat conversation
   {c('/quit', 'cyan')}                exit (also: /exit, Ctrl-D)
@@ -72,6 +73,7 @@ class Repl:
         api_key: str | None = None,
         think: bool | None = None,
         keep_alive: str | None = None,
+        system_prompt: str | None = None,
         spawn_settings: SpawnSettings | None = None,
     ):
         self.manager = manager
@@ -85,6 +87,7 @@ class Repl:
         self._api_key = api_key
         self._think = think
         self._keep_alive = keep_alive
+        self._system_prompt = system_prompt
         self._spawn_settings = spawn_settings or SpawnSettings()
         # Offer spawn_subagent to the LLM as a local tool (mirrors /spawn).
         install_spawn_tool(self.manager, self._spawn_settings)
@@ -93,7 +96,8 @@ class Repl:
     def _init_agent(self) -> None:
         """Select a chat backend per --backend (or auto-detect)."""
         settings = ChatSettings(model=self._model, host=self._host, api_key=self._api_key,
-                                think=self._think, keep_alive=self._keep_alive)
+                                think=self._think, keep_alive=self._keep_alive,
+                                system_prompt=self._system_prompt)
         try:
             self.agent = build_agent(self._backend, self.manager, settings)
         except BackendUnavailable as e:
@@ -177,6 +181,15 @@ class Repl:
             self.manager, name, self._spawn_settings, system_prompt, config)
         print(c(parts_to_text(content), "red" if is_error else "green"))
 
+    async def cmd_kill(self, arg: str) -> None:
+        name = arg.strip().split()[0] if arg.strip() else ""
+        if not name:
+            print(c("  Usage: /kill <name>", "yellow"))
+            return
+        print(c(f"  → removing subagent {name!r} …", "dim"))
+        content, is_error = await remove_subagent(self.manager, name)
+        print(c(parts_to_text(content), "red" if is_error else "green"))
+
     async def cmd_chat(self, text: str) -> None:
         if self.agent is None:
             print(c(f"  Chat unavailable: {self.agent_error}", "yellow"))
@@ -250,6 +263,8 @@ class Repl:
             await self.cmd_call(arg)
         elif cmd == "spawn":
             await self.cmd_spawn(arg)
+        elif cmd == "kill":
+            await self.cmd_kill(arg)
         elif cmd == "thinking":
             self.show_thinking = not self.show_thinking
             print(c(f"  show reasoning: {self.show_thinking}", "dim"))
@@ -328,16 +343,24 @@ async def _amain(argv: list[str] | None = None) -> int:
 
     if args.serve:
         # MCP server mode: no stdout chatter (the protocol owns stdout).
+        if args.config:
+            # Carry the config's systemPrompt into settings; serve() re-reads the
+            # file for its servers and will surface any config error itself.
+            try:
+                settings.system_prompt = load_config(args.config).system_prompt
+            except (FileNotFoundError, ValueError):
+                pass
         from .server import serve  # noqa: PLC0415 — pulls in FastMCP only when serving
         return await serve(config_path=args.config, backend=args.backend,
                            settings=settings, spawn_settings=spawn_settings)
 
     config = args.config or str(default_config_path())
     try:
-        servers = load_servers(config)
+        client_cfg = load_config(config)
     except (FileNotFoundError, ValueError) as e:
         print(c(f"Config error: {e}", "red"), file=sys.stderr)
         return 2
+    servers = client_cfg.servers
 
     print(c(f"Connecting to {len(servers)} MCP server(s) from {config} …", "dim"))
     async with MCPManager(servers) as manager:
@@ -349,6 +372,7 @@ async def _amain(argv: list[str] | None = None) -> int:
         repl = Repl(manager, backend=args.backend, model=args.model,
                     host=args.ollama_host, api_key=args.ollama_api_key,
                     think=think, keep_alive=args.ollama_keep_alive,
+                    system_prompt=client_cfg.system_prompt,
                     spawn_settings=spawn_settings)
         await repl.run()
     print(c("bye.", "dim"))

@@ -57,6 +57,7 @@ class ChatSettings:
     api_key: str | None = None  # Ollama Bearer token (optional); Anthropic uses the SDK/env
     think: bool | None = None       # Ollama: per-request reasoning toggle (None = model default)
     keep_alive: str | None = None   # Ollama: how long to keep the model resident in VRAM
+    system_prompt: str | None = None  # overrides SYSTEM_PROMPT (e.g. from the config file)
 
 
 @dataclass
@@ -90,7 +91,7 @@ class BaseAgent(ABC):
         self._manager = manager
         self.show_thinking = False
         self.warning: str | None = None
-        #: Mutable so a subagent's ``set_system_prompt`` tool can re-steer it.
+        #: Overridden by ``build_agent`` from a config file's ``systemPrompt``.
         self.system_prompt = SYSTEM_PROMPT
         self._messages: list[Any] = []
         #: Full LLM transcript for this process → /tmp/<pid>.log.

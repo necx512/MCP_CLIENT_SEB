@@ -12,6 +12,18 @@ works here works there, and vice-versa. Each server entry supports:
     }
 
 Only stdio transport is supported (the transport every local MCP server uses).
+
+The file may also carry an optional top-level ``systemPrompt`` that overrides the
+agent's built-in system prompt — a plain string, or a list of strings joined by
+newlines for a readable multi-line prompt in JSON::
+
+    {
+      "systemPrompt": ["You are a pentest assistant.", "Only touch in-scope hosts."],
+      "mcpServers": { ... }
+    }
+
+Claude Desktop ignores unknown top-level keys, so a config with ``systemPrompt``
+still works there — the extra key is simply this client's own.
 """
 
 from __future__ import annotations
@@ -55,8 +67,16 @@ class ServerConfig:
         return {**os.environ, **self.env}
 
 
-def load_servers(config_path: str | os.PathLike) -> dict[str, ServerConfig]:
-    """Parse ``config_path`` and return {name: ServerConfig}."""
+@dataclass
+class ClientConfig:
+    """Everything read from a client config file."""
+
+    servers: dict[str, ServerConfig] = field(default_factory=dict)
+    system_prompt: str | None = None  # overrides the built-in SYSTEM_PROMPT when set
+
+
+def load_config(config_path: str | os.PathLike) -> ClientConfig:
+    """Parse ``config_path`` into a :class:`ClientConfig` (servers + system prompt)."""
     path = Path(config_path).expanduser()
     if not path.is_file():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -73,7 +93,26 @@ def load_servers(config_path: str | os.PathLike) -> dict[str, ServerConfig]:
             '(use {"mcpServers": {}} for no servers)'
         )
 
-    return {name: ServerConfig.from_dict(name, cfg) for name, cfg in servers.items()}
+    return ClientConfig(
+        servers={name: ServerConfig.from_dict(name, cfg) for name, cfg in servers.items()},
+        system_prompt=_parse_system_prompt(raw.get("systemPrompt")),
+    )
+
+
+def load_servers(config_path: str | os.PathLike) -> dict[str, ServerConfig]:
+    """Parse ``config_path`` and return {name: ServerConfig}."""
+    return load_config(config_path).servers
+
+
+def _parse_system_prompt(value: Any) -> str | None:
+    """Normalize the optional ``systemPrompt`` key (string or list of lines)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, list):  # list of lines → readable multi-line prompt in JSON
+        return "\n".join(str(line) for line in value).strip() or None
+    raise ValueError("'systemPrompt' must be a string or a list of strings")
 
 
 def default_config_path() -> Path:

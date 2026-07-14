@@ -1,0 +1,10 @@
+{
+  "systemPrompt": "You are a web agent",
+  "mcpServers": {
+    "chrome-selenium": {
+      "command": "/home/debian/venv/bin/python",
+      "args": ["server.py"],
+      "cwd": "/home/debian/Chrome/chrome-agent-selenium"
+    }
+  }
+}

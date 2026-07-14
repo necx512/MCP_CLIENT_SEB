@@ -45,7 +45,14 @@ def build_agent(backend: str, manager: MCPManager, settings: ChatSettings) -> Ba
     for name in order:
         cls = BACKENDS[name]
         try:
-            return cls.create(manager, settings)
+            agent = cls.create(manager, settings)
         except BackendUnavailable as e:
             errors.append(f"{name} → {e}")
+            continue
+        if settings.system_prompt:
+            # Config-supplied prompt overrides the default; reset() so backends
+            # that bake the system turn into history (Ollama) pick it up.
+            agent.system_prompt = settings.system_prompt
+            agent.reset()
+        return agent
     raise BackendUnavailable(" | ".join(errors) or f"unknown backend: {backend}")

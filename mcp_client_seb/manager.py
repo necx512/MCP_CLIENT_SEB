@@ -169,6 +169,32 @@ class MCPManager:
             handler=handler,
         )
 
+    async def disconnect(self, name: str) -> list[str]:
+        """Tear down one server connection: stop its process and drop its tools.
+
+        Signals just this connection's shutdown event and awaits its owning task
+        (so the ``async with`` unwinds in the same task that opened it, per
+        :meth:`_run_connection`), then removes its tools and bookkeeping so the
+        name is free to reuse. Returns the exposed names that were dropped.
+        Raises :class:`KeyError` if no such connection exists.
+        """
+        task = self._conn_tasks.get(name)
+        if task is None:
+            raise KeyError(name)
+        event = self._shutdown.get(name)
+        if event is not None:
+            event.set()
+        await asyncio.gather(task, return_exceptions=True)
+        self._conn_tasks.pop(name, None)
+        self._shutdown.pop(name, None)
+        self.sessions.pop(name, None)
+        self.connect_errors.pop(name, None)
+        self._servers.pop(name, None)
+        removed = [n for n, ref in list(self.tools.items()) if ref.server == name]
+        for n in removed:
+            self.tools.pop(n, None)
+        return removed
+
     async def aclose(self) -> None:
         """Signal every connection task to unwind, then wait for them all."""
         for event in self._shutdown.values():

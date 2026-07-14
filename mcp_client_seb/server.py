@@ -11,9 +11,11 @@ tools let the parent configure it and delegate work to it:
     ask(prompt)                       run the subagent's own agent loop, return
                                       its answer (it uses its own tools + LLM)
     connect_server(name, command, …)  give the subagent a new MCP server
-    set_system_prompt(text)           re-steer the subagent's LLM
     list_tools()                      list the tools the subagent currently has
     reset()                           start the subagent on a fresh conversation
+
+The subagent's system prompt is fixed at launch (from its config file's
+``systemPrompt``); there is no runtime re-steering tool.
 
 Nothing here writes to stdout except the MCP protocol itself (FastMCP owns the
 stream); logs go to stderr.
@@ -42,22 +44,21 @@ class _Subagent:
         self._settings = settings
         self.agent: BaseAgent | None = None
         self.agent_error: str | None = None
-        self.system_prompt: str | None = None
         self._lock = asyncio.Lock()  # serialize ask() — one conversation, one turn at a time
 
     def ensure_agent(self) -> BaseAgent | None:
-        """Build the LLM backend on first use; cache the failure if unavailable."""
+        """Build the LLM backend on first use; cache the failure if unavailable.
+
+        The system prompt (if any) comes from the config file the subagent was
+        launched with, applied by :func:`build_agent` — there's no runtime
+        re-steering.
+        """
         if self.agent is None and self.agent_error is None:
             try:
                 self.agent = build_agent(self._backend, self.manager, self._settings)
             except BackendUnavailable as e:
                 self.agent_error = str(e)
                 logger.warning("subagent has no LLM backend: %s", e)
-        if self.agent is not None and self.system_prompt is not None:
-            # Apply a system prompt that was set before the agent existed.
-            if self.agent.system_prompt != self.system_prompt:
-                self.agent.system_prompt = self.system_prompt
-                self.agent.reset()
         return self.agent
 
 
@@ -108,14 +109,6 @@ def _build_mcp(state: _Subagent):
             return f"Failed to connect {name!r}: {type(e).__name__}: {e}"
         return f"Connected {name!r}. New tools: " + (", ".join(new_tools) or "(none)")
 
-    async def set_system_prompt(text: str) -> str:
-        """Replace the subagent's system prompt (also resets its conversation)."""
-        state.system_prompt = text
-        if state.agent is not None:
-            state.agent.system_prompt = text
-            state.agent.reset()
-        return "System prompt updated; conversation reset."
-
     async def list_tools() -> str:
         """List the MCP tools the subagent currently has available."""
         refs = sorted(state.manager.tools.values(), key=lambda r: r.exposed_name)
@@ -137,8 +130,6 @@ def _build_mcp(state: _Subagent):
                  description="Delegate a task to this subagent; returns its answer.")
     mcp.add_tool(connect_server, name="connect_server",
                  description="Connect the subagent to a new stdio MCP server.")
-    mcp.add_tool(set_system_prompt, name="set_system_prompt",
-                 description="Set the subagent's system prompt (resets its conversation).")
     mcp.add_tool(list_tools, name="list_tools",
                  description="List the tools the subagent currently has.")
     mcp.add_tool(reset, name="reset",

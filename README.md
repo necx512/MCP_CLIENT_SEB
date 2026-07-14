@@ -218,6 +218,7 @@ with a message (and manual `/call` still works).
 | `/schema <tool>` | Print a tool's JSON input schema (so you know what args to pass). |
 | `/call <tool> [json]` | Call a tool directly. `json` is its arguments; omit for none. |
 | `/spawn <name> [prompt]` | Launch a **subagent** (this project in server mode) and connect it dynamically. Drive it via its `<name>__ask` tool. See [§13](#13-subagents-spawning-and-controlling-instances). |
+| `/kill <name>` | Stop a spawned subagent: terminate its process and drop its `<name>__` tools. |
 | `/thinking` | Toggle showing Claude's reasoning summary in chat mode. |
 | `/reset` | Clear the chat conversation and start fresh. |
 | `/quit` | Exit. Also `/exit`, `/q`, or Ctrl-D. |
@@ -498,9 +499,13 @@ Once connected as `worker`, these appear in the parent's tool namespace:
 |---|---|
 | `worker__ask(prompt)` | Delegate a task. The subagent reasons with its **own** LLM and tools, then returns its answer. |
 | `worker__connect_server(name, command, args, env, cwd)` | Give the subagent a new MCP server — **dynamic configuration**. |
-| `worker__set_system_prompt(text)` | Re-steer the subagent's LLM. |
 | `worker__list_tools()` | List the tools the subagent currently has. |
 | `worker__reset()` | Start the subagent on a fresh conversation. |
+
+A subagent's **system prompt is fixed at spawn time**, delivered through its
+config file's `systemPrompt` key (created on the fly when you pass a prompt to
+`/spawn` or `spawn_subagent`). There is no runtime re-steering tool — to change
+it, respawn the subagent or edit its config.
 
 ### Two ways to spawn
 
@@ -512,19 +517,25 @@ mcp> /spawn worker You are a focused web-research subagent.
 Spawned subagent 'worker'. New tools:
   - worker__ask
   - worker__connect_server
-  - worker__set_system_prompt
   - worker__list_tools
   - worker__reset
+  system prompt: baked into the subagent's config
 Delegate work with worker__ask.
 
 mcp> /call worker__connect_server {"name": "web", "command": "python3", "args": ["-m", "some_web_server"]}
 mcp> /call worker__ask {"prompt": "Summarize example.com"}
 ```
 
-**From chat** (LLM-driven): the parent's model is given a built-in
-`spawn_subagent` tool, so it can create and orchestrate subagents itself — spawn
-a worker, give it servers via `worker__connect_server`, then delegate with
-`worker__ask` — all within one conversation.
+**From chat** (LLM-driven): the parent's model is given built-in
+`spawn_subagent` and `remove_subagent` tools, so it can create, orchestrate, and
+tear down subagents itself — spawn a worker, give it servers via
+`worker__connect_server`, delegate with `worker__ask`, then `remove_subagent` it
+when done — all within one conversation.
+
+**Removing a subagent** — `/kill <name>` (or the `remove_subagent` tool) stops
+the subagent's process and drops its `<name>__` tools; the name is then free to
+reuse. It only acts on spawned subagents, never on statically configured
+servers.
 
 ### Notes
 
