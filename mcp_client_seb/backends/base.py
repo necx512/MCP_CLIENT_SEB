@@ -10,25 +10,66 @@ lives here once, and each backend implements a handful of small hooks:
     label                  human-readable name incl. the model.
     _tool_specs()          the MCP tools in this provider's schema shape.
     _complete()            one blocking API call -> a normalized Turn.
+    _parse()               provider-native response payload -> a Turn.
     _record_assistant()    append the assistant turn to history.
     _record_tool_results() append this turn's tool results to history.
     _initial_messages()    the starting message list (e.g. a system turn).
 
-The loop, refusal handling, thinking/text emission, and the tool fan-out are
-shared. See ``anthropic_backend`` and ``ollama_backend`` for the two ~90-line
-implementations.
+The loop, refusal handling, thinking/text emission, the tool fan-out, and the
+interception points are shared. See ``anthropic_backend`` and ``ollama_backend``
+for the two ~100-line implementations.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..convlog import ConversationLog
 from ..manager import MCPManager, ToolRef, parts_to_text
+
+try:  # Optional, like `anthropic`: an external tool, not a feature of this client.
+    from llm_interceptor import build_interceptor
+except ImportError:  # not installed -> the pauses below are a no-op, and free
+    class _Forward:
+        dropped = False
+        edited = False
+        payload = None
+
+    _FORWARD = _Forward()
+
+    class _NoInterceptor:
+        async def intercept(self, point: str, payload: Any) -> Any:
+            return _FORWARD
+
+    def build_interceptor(label: str = "") -> Any:
+        return _NoInterceptor()
+
+
+def jsonify(value: Any) -> Any:
+    """Provider SDK objects -> plain JSON data.
+
+    Ours, not the interceptor's, even though llm_interceptor exports an
+    identical helper. This is on the *parse* path — ``AnthropicAgent._complete``
+    needs its response as dicts to read it at all — so it has to work with no
+    optional package installed. Importing it from llm_interceptor once meant the
+    Anthropic backend broke outright whenever that package was absent.
+    """
+    for attr in ("to_dict", "model_dump"):
+        fn = getattr(value, attr, None)
+        if callable(fn):
+            try:
+                return jsonify(fn())
+            except Exception:  # noqa: BLE001 — never break a turn over rendering
+                break
+    if isinstance(value, dict):
+        return {k: jsonify(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonify(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant with access to tools provided by one or more "
@@ -78,7 +119,13 @@ class Turn:
     tool_calls: list[ToolCall] = field(default_factory=list)
     refused: bool = False
     refusal_message: str = ""
-    raw: Any = None  # provider-native payload, replayed verbatim into history
+    raw: Any = None   # provider-native payload, replayed verbatim into history
+    #: JSON-safe view of the provider's response, shown to (and editable by) the
+    #: interceptor. Distinct from ``raw`` because for Anthropic ``raw`` holds the
+    #: SDK's own block objects: replaying those keeps the untouched path exactly
+    #: as it was before interception existed. Only an actual edit swaps ``raw``
+    #: for plain dicts, via ``_parse``.
+    wire: Any = None
 
 
 class BaseAgent(ABC):
@@ -94,9 +141,14 @@ class BaseAgent(ABC):
         #: Overridden by ``build_agent`` from a config file's ``systemPrompt``.
         self.system_prompt = SYSTEM_PROMPT
         self._messages: list[Any] = []
-        #: Full LLM transcript for this process → /tmp/<pid>.log.
-        self.log = ConversationLog()
-        self._logged_sig: Any = None  # last (system_prompt, tool-names) written
+        try:
+            label = self.label
+        except Exception:  # noqa: BLE001 — identity is cosmetic; never block startup
+            label = ""
+        #: Pauses ``send`` for a human when the optional ``llm_interceptor``
+        #: package is installed and its console is attached; a no-op (and free)
+        #: otherwise. See the fallback stub at the top of this module.
+        self._intercept = build_interceptor(label)
         self.reset()
 
     # -- construction / identity (subclass) --------------------------------
@@ -118,6 +170,15 @@ class BaseAgent(ABC):
         """Make one blocking model call over ``self._messages`` -> Turn.
 
         May raise :class:`BackendError` for recoverable request failures.
+        """
+
+    @abstractmethod
+    def _parse(self, wire: Any) -> Turn:
+        """Provider-native response payload -> Turn, with ``raw`` and ``wire`` set.
+
+        ``_complete`` uses this so there's one parser, and the interceptor
+        re-runs it on an edited payload — the human edits the provider's own
+        response shape and the client re-reads it, exactly as a proxy does.
         """
 
     @abstractmethod
@@ -148,38 +209,6 @@ class BaseAgent(ABC):
         """Start a fresh conversation."""
         self._messages = self._initial_messages()
 
-    # -- conversation logging (shared) -------------------------------------
-
-    def _log_context(self) -> None:
-        """Log the system prompt + tools, but only when they've changed."""
-        refs = self._tool_refs()
-        sig = (self.system_prompt, tuple(sorted(t.exposed_name for t in refs)))
-        if sig == self._logged_sig:
-            return
-        self._logged_sig = sig
-        self.log.entry("SYSTEM PROMPT", self.system_prompt)
-        if refs:
-            lines = []
-            for t in refs:
-                summary = t.description.strip().splitlines()[0] if t.description.strip() else ""
-                lines.append(f"- {t.exposed_name}: {summary}")
-                lines.append(f"    input_schema: {json.dumps(t.input_schema)}")
-            self.log.entry(f"TOOLS ({len(refs)})", "\n".join(lines))
-        else:
-            self.log.entry("TOOLS (0)", "(none)")
-
-    def _log_assistant(self, turn: "Turn") -> None:
-        parts: list[str] = []
-        if turn.thinking:
-            parts.append(f"[reasoning]\n{turn.thinking}")
-        if turn.text:
-            parts.append(turn.text)
-        for call in turn.tool_calls:
-            parts.append(f"[tool_call] {call.name}({json.dumps(call.arguments)})")
-        if turn.refused:
-            parts.append(f"[refused] {turn.refusal_message}")
-        self.log.entry("ASSISTANT", "\n".join(parts) if parts else "(empty)")
-
     # -- the loop (shared across every backend) ----------------------------
 
     async def send(self, user_text: str, on_event) -> None:
@@ -187,20 +216,27 @@ class BaseAgent(ABC):
 
         ``on_event(kind, payload)`` kinds:
         {"thinking", "text", "tool_call", "tool_result", "error"}.
+
+        Four points here can pause for a human if the optional ``llm_interceptor``
+        package is installed and its console is attached; otherwise they're a
+        no-op. ``_complete`` runs in a worker thread, so this loop is free to
+        await a decision on the event loop — pausing costs nothing structurally.
         """
-        self._log_context()
-        self.log.entry("USER", user_text)
         self._add_user(user_text)
 
         for _ in range(MAX_TOOL_ITERATIONS):
+            if not await self._intercept_request(on_event):
+                return
+
             try:
                 turn = await asyncio.to_thread(self._complete)
             except BackendError as e:
-                self.log.entry("ERROR", str(e))
                 on_event("error", str(e))
                 return
 
-            self._log_assistant(turn)
+            turn = await self._intercept_response(turn, on_event)
+            if turn is None:
+                return
 
             if turn.refused:
                 on_event("error", turn.refusal_message or "The model declined to respond.")
@@ -217,15 +253,71 @@ class BaseAgent(ABC):
 
             results: list[tuple[ToolCall, list, bool]] = []
             for call in turn.tool_calls:
-                on_event("tool_call", {"name": call.name, "input": call.arguments})
-                content, is_error = await self._manager.call_tool(call.name, call.arguments)
-                text = parts_to_text(content)
-                self.log.entry(
-                    f"TOOL RESULT [{'error' if is_error else 'ok'}] {call.name}", text)
-                on_event("tool_result",
-                         {"name": call.name, "text": text, "is_error": is_error})
-                results.append((call, content, is_error))
+                results.append(await self._run_tool(call, on_event))
             self._record_tool_results(results)
 
-        self.log.entry("ERROR", f"Stopped after {MAX_TOOL_ITERATIONS} tool iterations.")
         on_event("error", f"Stopped after {MAX_TOOL_ITERATIONS} tool iterations.")
+
+    async def _run_tool(self, call: ToolCall, on_event) -> tuple[ToolCall, list, bool]:
+        """One tool call, with the call and its result each interceptable."""
+        verdict = await self._intercept.intercept(
+            "tool_call", {"name": call.name, "arguments": call.arguments})
+        if verdict.dropped:
+            # A dropped call still needs a result: Anthropic rejects a turn whose
+            # tool_use block has no matching tool_result, so silently skipping it
+            # would 400 on the next request rather than doing nothing.
+            return self._synthetic_result(call, "[dropped at the interceptor]", on_event)
+        if verdict.edited:
+            call.name = verdict.payload.get("name", call.name)
+            call.arguments = verdict.payload.get("arguments", call.arguments)
+
+        on_event("tool_call", {"name": call.name, "input": call.arguments})
+        content, is_error = await self._manager.call_tool(call.name, call.arguments)
+
+        verdict = await self._intercept.intercept(
+            "tool_result",
+            {"name": call.name, "is_error": is_error, "parts": jsonify(content)})
+        if verdict.dropped:
+            return self._synthetic_result(call, "[result dropped at the interceptor]",
+                                          on_event)
+        if verdict.edited:
+            content = verdict.payload.get("parts", content)
+            is_error = bool(verdict.payload.get("is_error", is_error))
+
+        text = parts_to_text(content)
+        on_event("tool_result", {"name": call.name, "text": text, "is_error": is_error})
+        return (call, content, is_error)
+
+    def _synthetic_result(self, call: ToolCall, text: str,
+                          on_event) -> tuple[ToolCall, list, bool]:
+        parts = [{"type": "text", "text": text}]
+        on_event("tool_result", {"name": call.name, "text": text, "is_error": True})
+        return (call, parts, True)
+
+    # -- interception points -----------------------------------------------
+
+    async def _intercept_request(self, on_event) -> bool:
+        """Pause before the model call. Returns False if the turn was dropped."""
+        verdict = await self._intercept.intercept(
+            "request",
+            {"system": self.system_prompt, "messages": jsonify(self._messages)})
+        if verdict.dropped:
+            on_event("error", "Request dropped at the interceptor.")
+            return False
+        if verdict.edited:
+            # Edits land in history, not just this call: ``_messages`` *is* the
+            # conversation. That differs from Burp, where editing a request
+            # leaves the browser's own state untouched — here it's how you steer.
+            self.system_prompt = verdict.payload.get("system", self.system_prompt)
+            self._messages = verdict.payload.get("messages", self._messages)
+        return True
+
+    async def _intercept_response(self, turn: Turn, on_event) -> Turn | None:
+        """Pause on the model's reply. Returns None if the turn was dropped."""
+        verdict = await self._intercept.intercept("response", turn.wire)
+        if verdict.dropped:
+            on_event("error", "Response dropped at the interceptor.")
+            return None
+        if verdict.edited:
+            return self._parse(verdict.payload)
+        return turn

@@ -18,6 +18,7 @@ from .base import (
     ChatSettings,
     ToolCall,
     Turn,
+    jsonify,  # re-exported by base so the optional-import lives in one place
 )
 
 MODEL = "claude-opus-4-8"
@@ -77,22 +78,47 @@ class AnthropicAgent(BaseAgent):
         except Exception as e:  # noqa: BLE001 — surface SDK/network errors to the loop
             raise BackendError(f"Anthropic request failed: {type(e).__name__}: {e}") from e
 
-        turn = Turn(raw=response.content)
-        if getattr(response, "stop_reason", None) == "refusal":
+        turn = self._parse({
+            "stop_reason": getattr(response, "stop_reason", None),
+            "content": jsonify(response.content),
+        })
+        # Untouched path: replay the SDK's own block objects, exactly as this did
+        # before interception existed. Only an edited response swaps in the dict
+        # form (via _parse), so a serialization quirk can only ever surface on a
+        # turn a human deliberately edited — never on a normal one.
+        turn.raw = response.content
+        return turn
+
+    def _parse(self, wire: dict[str, Any]) -> Turn:
+        """A Message-shaped dict -> Turn. Mirrors the wire format, not the SDK.
+
+        Note for editing: ``thinking`` blocks must be replayed to the API
+        byte-for-byte — they carry a signature the API verifies, and a modified
+        block is rejected. Their text is over the eliding threshold in practice,
+        so the interceptor hands the human a placeholder rather than the real
+        signature, which keeps an edit elsewhere in the response from
+        accidentally corrupting one.
+        """
+        blocks = wire.get("content") or []
+        turn = Turn(raw=blocks, wire=wire)
+        if wire.get("stop_reason") == "refusal":
             turn.refused = True
             turn.refusal_message = "Claude declined to respond to this request."
             return turn
 
         texts: list[str] = []
-        for block in response.content:
-            if block.type == "text":
-                texts.append(block.text)
-            elif block.type == "thinking":
-                turn.thinking += getattr(block, "thinking", "") or ""
-            elif block.type == "tool_use":
-                turn.tool_calls.append(
-                    ToolCall(name=block.name, arguments=block.input or {}, id=block.id)
-                )
+        for block in blocks:
+            btype = block.get("type")
+            if btype == "text":
+                texts.append(block.get("text", ""))
+            elif btype == "thinking":
+                turn.thinking += block.get("thinking", "") or ""
+            elif btype == "tool_use":
+                turn.tool_calls.append(ToolCall(
+                    name=block.get("name", ""),
+                    arguments=block.get("input") or {},
+                    id=block.get("id"),
+                ))
         turn.text = "".join(texts)
         return turn
 

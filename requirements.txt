@@ -4,3 +4,9 @@ mcp>=1.0.0
 # Optional — only needed for the Claude-driven chat mode.
 # Manual /call tool access works without it.
 anthropic>=0.49.0
+
+# Optional — Burp-style interception of the agent<->LLM conversation.
+# A separate project and a separate tool; this client works unchanged without
+# it. Install with:  pip install --user -e ../INTERCEPTOR
+# Then run its console in another terminal:  python3 -m llm_interceptor
+#llm-interceptor

@@ -96,7 +96,20 @@ class SpawnSettings:
         args = list(self.serve_args)
         if config:
             args += ["--config", config]
-        return ServerConfig(name=name, command=self.python, args=args)
+        # Name this child for an attached interceptor (an optional external tool
+        # — see llm_interceptor), so it can tell "root/worker/scout" from
+        # "root/worker". The parent's own path travels in the env, so this
+        # composes to arbitrary depth with no extra plumbing, and a child
+        # overrides the value it inherited rather than reusing it. Harmless when
+        # nothing is listening, and a no-op when the package isn't installed.
+        env = {}
+        try:
+            from llm_interceptor import child_agent_path  # noqa: PLC0415
+        except ImportError:
+            pass
+        else:
+            env["INTERCEPT_AGENT_PATH"] = child_agent_path(name)
+        return ServerConfig(name=name, command=self.python, args=args, env=env)
 
 
 async def spawn_subagent(

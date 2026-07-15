@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "chrome-axtree": {
-      "command": "/home/debian/Chrome/chrome-agent-venv/bin/python",
-      "args": ["server.py"],
-      "cwd": "/home/debian/Chrome/chrome-agent-axtree"
-    }
-  }
-}

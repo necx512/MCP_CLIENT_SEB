@@ -185,13 +185,21 @@ class OllamaAgent(BaseAgent):
         except (OSError, ValueError) as e:
             raise BackendError(f"Ollama error: {type(e).__name__}: {e}") from e
 
-        message = resp.get("message", {}) or {}
+        return self._parse(resp.get("message", {}) or {})
+
+    def _parse(self, wire: dict[str, Any]) -> Turn:
+        """An Ollama ``message`` object -> Turn.
+
+        Ollama's response is already plain JSON, so ``raw`` and ``wire`` are the
+        same object — an edited response needs no special handling here.
+        """
         turn = Turn(
-            raw=message,
-            text=message.get("content", "") or "",
-            thinking=message.get("thinking", "") or "",
+            raw=wire,
+            wire=wire,
+            text=wire.get("content", "") or "",
+            thinking=wire.get("thinking", "") or "",
         )
-        for call in message.get("tool_calls") or []:
+        for call in wire.get("tool_calls") or []:
             fn = call.get("function", {}) or {}
             args = fn.get("arguments", {}) or {}
             if isinstance(args, str):  # some models emit a JSON string
