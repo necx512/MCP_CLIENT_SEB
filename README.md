@@ -30,6 +30,7 @@ It comes pre-wired to the **`re-assistant`** reverse-engineering MCP server in
 11. [Troubleshooting](#11-troubleshooting)
 12. [How it works](#12-how-it-works)
 13. [Subagents (spawning and controlling instances)](#13-subagents-spawning-and-controlling-instances)
+14. [Tool permissions (approve before running)](#14-tool-permissions-approve-before-running)
 
 ---
 
@@ -349,6 +350,7 @@ automatically renamed `server__tool` (e.g. `files__read`) so both stay callable.
 | `args` | — | List of arguments. |
 | `cwd` | — | Working directory for the server process. |
 | `env` | — | Extra env vars (layered on top of your current environment). |
+| `requirePermission` | — | Gate this server's tools behind human approval: `true` (all), `false`/omitted (none), or a list of tool names. See [§14](#14-tool-permissions-approve-before-running). |
 
 **Command-line flags:**
 
@@ -547,6 +549,126 @@ servers.
   runtime; `spawn_subagent(manager, "worker", SpawnSettings())` wraps the launch.
 * Subagent processes are children of the parent and are shut down cleanly when
   the parent exits.
+
+---
+
+## 14. Tool permissions (approve before running)
+
+Some tools shouldn't run unattended — running a shell command, deleting a file,
+posting to an API. This client can **pause and ask you** before it executes such
+a tool, whether the call came from the LLM in chat mode or from a manual
+`/call`. The gate is generic: it works for **every tool on every MCP server**,
+not just ones written for this client.
+
+### Two places decide — and they OR together
+
+Whether a given tool needs approval is decided by **two independent sources**:
+
+1. **The MCP server** that owns the tool can declare it needs permission, in its
+   tool metadata (see below).
+2. **This client's config file** can require it, per-server or globally.
+
+The rule is a logical **OR**: if *either* side asks for permission, you are
+asked. A tool runs without prompting **only when both sides stay silent**. So a
+cautious server is honoured even if your config says nothing, and a cautious
+config is honoured even for a server that declares nothing.
+
+### Configuring it in the client (`servers.json`)
+
+**Per server** — add `requirePermission` inside a server's entry:
+
+```json
+{
+  "mcpServers": {
+    "bash":  { "command": "python3", "args": ["bash_server.py"],
+               "requirePermission": true },
+    "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+               "requirePermission": ["write_file", "move_file"] }
+  }
+}
+```
+
+- `true` — every tool from this server needs approval.
+- `false` / omitted — this server adds no client-side requirement (the server's
+  own declaration can still trigger it).
+- `["a", "b"]` — only those tools (by their un-namespaced name) need approval.
+
+**Globally** — a top-level `requirePermission` applies across *all* servers:
+
+```json
+{
+  "requirePermission": true,                 // ask before every tool, everywhere
+  "mcpServers": { ... }
+}
+```
+
+or a list of tool names: `"requirePermission": ["run_bash", "delete_user"]`.
+
+### Configuring it in the server
+
+A server marks a tool as needing approval through standard MCP tool metadata —
+either the tool's `_meta` or a custom annotation. The bundled **`bash_server.py`**
+does both:
+
+```python
+mcp.add_tool(
+    run_bash, name="run_bash",
+    description="Execute a bash command on the host and return its output.",
+    annotations=ToolAnnotations(destructiveHint=True, requiresPermission=True),
+    meta={"requiresPermission": True},
+)
+```
+
+This client reads `requiresPermission` from either place. Because the flag
+travels **with the tool**, the server author's intent is respected by any client
+that honours it — the protection ships with the server, not the config.
+
+### What the prompt looks like
+
+When a gated tool is about to run:
+
+```
+mcp> run /bin/ls in the current directory
+
+  🔒 permission required — run_bash (bash)
+     args: {"command": "ls -la"}
+     allow? [y]es once / [n]o / [a]lways this session:
+```
+
+- **`y`** — allow this one call.
+- **`n`** (or just Enter — the safe default) — deny it; in chat mode the model is
+  told the call was denied and can react.
+- **`a`** — allow it **and** stop asking for this tool for the rest of the
+  session.
+
+Gated tools are flagged with `🔒` in `/tools`.
+
+### The bundled bash server
+
+`bash_server.py` is a minimal, ready-to-use example: an MCP server exposing a
+single `run_bash` tool, pre-declared as permission-required. `servers.json`
+already wires it up, so out of the box:
+
+```
+mcp> /tools
+  run_bash (bash) 🔒
+      Execute a bash command on the host and return its output.
+mcp> /call run_bash {"command": "uname -a"}
+  🔒 permission required — run_bash (bash)
+     allow? [y]es once / [n]o / [a]lways this session: y
+  [ok]
+  [exit 0]
+  Linux ...
+```
+
+### Headless / subagent mode
+
+A [subagent](#13-subagents-spawning-and-controlling-instances) (`--serve`) has no
+human attached, so it **cannot** prompt. A permission-gated tool called inside a
+subagent is **denied by default**, and the caller is told why. The subagent
+loads the same `requirePermission` rules its config declares, so it gates the
+same tools the parent would — it just can't approve them. Give a subagent only
+servers/tools it's allowed to run unattended.
 
 ---
 

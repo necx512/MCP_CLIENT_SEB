@@ -23,13 +23,18 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from .config import ServerConfig
+from .config import PermissionConfig, ServerConfig
 
 logger = logging.getLogger("mcp_client_seb.manager")
 
 #: A local tool handler: ``(arguments) -> (content_parts, is_error)``.
 #: ``content_parts`` is the same normalized list shape ``call_tool`` returns.
 LocalHandler = Callable[[dict[str, Any]], Awaitable[tuple[list[dict[str, Any]], bool]]]
+
+#: Asks a human to approve a tool call: ``(ToolRef, arguments) -> allowed?``.
+#: Injected by the REPL (interactive prompt). ``None`` means no approver is
+#: attached (e.g. subagent server mode) — permission-required tools are denied.
+PermissionPrompt = Callable[["ToolRef", dict[str, Any]], Awaitable[bool]]
 
 
 @dataclass
@@ -48,18 +53,29 @@ class ToolRef:
     description: str
     input_schema: dict[str, Any]
     handler: LocalHandler | None = None  # set for local tools; dispatched in-process
+    #: Resolved at registration: does calling this tool need human approval? True
+    #: if the server declared it (tool ``_meta``/annotations) OR the client's
+    #: config asks for it. Enforced in :meth:`MCPManager.call_tool`.
+    requires_permission: bool = False
 
 
 class MCPManager:
     """Launches MCP servers and provides a unified tool interface."""
 
-    def __init__(self, servers: dict[str, ServerConfig]):
+    def __init__(self, servers: dict[str, ServerConfig],
+                 permissions: PermissionConfig | None = None):
         self._servers = servers
+        self._permissions = permissions or PermissionConfig()
         self.sessions: dict[str, ClientSession] = {}
         self.tools: dict[str, ToolRef] = {}
         self.connect_errors: dict[str, str] = {}
         self._conn_tasks: dict[str, asyncio.Task] = {}
         self._shutdown: dict[str, asyncio.Event] = {}
+        #: Set by the REPL to an interactive approver; left ``None`` in headless
+        #: (subagent) mode, where permission-required tools are denied by default.
+        self.permission_prompt: PermissionPrompt | None = None
+        #: Tools the human chose to "always allow" this session (exposed names).
+        self.always_allow: set[str] = set()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -145,12 +161,15 @@ class MCPManager:
                 # Namespace on collision so two servers can both expose e.g. "read".
                 if exposed in self.tools:
                     exposed = f"{server}__{tool.name}"
+            declared = _server_declares_permission(tool)
             self.tools[exposed] = ToolRef(
                 exposed_name=exposed,
                 server=server,
                 original_name=tool.name,
                 description=tool.description or "",
                 input_schema=tool.inputSchema or {"type": "object", "properties": {}},
+                requires_permission=self._resolve_permission(
+                    server, exposed, tool.name, declared),
             )
 
     def register_local_tool(self, name: str, description: str,
@@ -167,7 +186,30 @@ class MCPManager:
             description=description,
             input_schema=input_schema,
             handler=handler,
+            requires_permission=self._resolve_permission(None, name, name, False),
         )
+
+    def _resolve_permission(self, server: str | None, exposed: str,
+                            original: str, server_declared: bool) -> bool:
+        """Does this tool need approval? server-declared OR any client-side rule.
+
+        The OR is the whole point: if *either* the server or the client asks for
+        permission, we ask. A tool is gated unless *both* sides stay silent.
+        """
+        if server_declared:
+            return True
+        perms = self._permissions
+        if perms.all_tools:                                   # global: gate all
+            return True
+        if exposed in perms.tools or original in perms.tools:  # global: named
+            return True
+        cfg = self._servers.get(server) if server else None
+        rp = getattr(cfg, "require_permission", False) if cfg else False
+        if rp is True:                                        # per-server: all
+            return True
+        if isinstance(rp, set) and (original in rp or exposed in rp):  # per-server: named
+            return True
+        return False
 
     async def disconnect(self, name: str) -> list[str]:
         """Tear down one server connection: stop its process and drop its tools.
@@ -220,6 +262,10 @@ class MCPManager:
         if ref is None:
             return [{"type": "text", "text": f"Unknown tool: {exposed_name!r}"}], True
 
+        denied = await self._check_permission(ref, arguments or {})
+        if denied is not None:
+            return denied
+
         if ref.handler is not None:  # local (in-process) tool
             try:
                 return await ref.handler(arguments or {})
@@ -234,6 +280,31 @@ class MCPManager:
             return [{"type": "text", "text": f"Tool call raised {type(e).__name__}: {e}"}], True
 
         return self._result_content(result), bool(getattr(result, "isError", False))
+
+    async def _check_permission(self, ref: ToolRef, arguments: dict[str, Any]):
+        """Gate a tool call. Returns a denial ``(content, True)`` or ``None`` to proceed.
+
+        Generic across every server: enforced here so both the agent loop and a
+        manual ``/call`` go through it. ``always_allow`` lets the human whitelist
+        a tool for the rest of the session.
+        """
+        if not ref.requires_permission or ref.exposed_name in self.always_allow:
+            return None
+        if self.permission_prompt is None:
+            # Headless (e.g. subagent server): nobody to ask → refuse, safely.
+            return ([{"type": "text",
+                      "text": f"Tool {ref.exposed_name!r} requires permission, but no "
+                              "approver is attached — denied."}], True)
+        try:
+            allowed = await self.permission_prompt(ref, arguments)
+        except Exception as e:  # noqa: BLE001 — a broken prompter must not auto-allow
+            return ([{"type": "text",
+                      "text": f"Permission check failed ({type(e).__name__}: {e}) — denied."}],
+                    True)
+        if not allowed:
+            return ([{"type": "text",
+                      "text": f"Permission denied by the user for {ref.exposed_name!r}."}], True)
+        return None
 
     @staticmethod
     def _result_content(result: Any) -> list[dict[str, Any]]:
@@ -258,6 +329,22 @@ class MCPManager:
             else:
                 parts.append({"type": "text", "text": str(block)})
         return parts or [{"type": "text", "text": "(no content returned)"}]
+
+
+def _server_declares_permission(tool: Any) -> bool:
+    """Did the MCP server itself mark this tool as needing approval?
+
+    Read from two spec-legal places so servers can use whichever is convenient:
+    the tool's ``_meta`` object (``{"requiresPermission": true}``) or a custom
+    ``requiresPermission`` field on its ``annotations`` (both allow extra keys).
+    """
+    meta = getattr(tool, "meta", None)
+    if isinstance(meta, dict) and meta.get("requiresPermission") is True:
+        return True
+    ann = getattr(tool, "annotations", None)
+    if ann is not None and getattr(ann, "requiresPermission", None) is True:
+        return True
+    return False
 
 
 def parts_to_text(parts: list[dict[str, Any]]) -> str:

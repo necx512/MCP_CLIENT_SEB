@@ -1,5 +1,10 @@
 {
   "systemPrompt": "You are a helpful assistant with access to tools provided by one or more Model Context Protocol (MCP) servers. Use the tools when they help answer the user's request, and explain your findings clearly. When a tool returns structured data, interpret it for the user rather than dumping it verbatim.",
   "mcpServers": {
+    "bash": {
+      "command": "python3",
+      "args": ["bash_server.py"],
+      "cwd": "/home/debian/IA/MCP_CLIENT_SEB"
+    }
   }
 }

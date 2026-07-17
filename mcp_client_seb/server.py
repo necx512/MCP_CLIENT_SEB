@@ -28,7 +28,7 @@ import json
 import logging
 
 from .backends import BackendUnavailable, BaseAgent, ChatSettings, build_agent
-from .config import ServerConfig, load_servers
+from .config import ClientConfig, ServerConfig, load_config
 from .manager import MCPManager
 from .subagent import SpawnSettings, install_spawn_tool
 
@@ -145,8 +145,11 @@ async def serve(
     spawn_settings: SpawnSettings,
 ) -> int:
     """Run this instance as an MCP server over stdio until the parent disconnects."""
-    servers = load_servers(config_path) if config_path else {}
-    async with MCPManager(servers) as manager:
+    client_cfg = load_config(config_path) if config_path else ClientConfig()
+    # No human is attached to a subagent, so any permission-gated tool is denied
+    # by default (see MCPManager._check_permission). The config's rules are still
+    # loaded so the subagent gates the same tools its parent would.
+    async with MCPManager(client_cfg.servers, permissions=client_cfg.permissions) as manager:
         # A subagent can itself spawn sub-subagents, so it also gets the local tool.
         install_spawn_tool(manager, spawn_settings)
         state = _Subagent(manager, backend, settings)

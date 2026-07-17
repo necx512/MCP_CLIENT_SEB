@@ -44,6 +44,11 @@ class ServerConfig:
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
+    #: Client-side permission requirement for *this server's* tools. ``True`` =
+    #: every tool needs approval, ``False`` = none (from the client's side), or a
+    #: set of tool names (original, un-namespaced) that need it. This is OR-ed
+    #: with whatever the server itself declares — see :class:`PermissionConfig`.
+    require_permission: bool | set[str] = False
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "ServerConfig":
@@ -55,6 +60,8 @@ class ServerConfig:
             args=[str(a) for a in data.get("args", [])],
             env={str(k): str(v) for k, v in (data.get("env") or {}).items()},
             cwd=data.get("cwd"),
+            require_permission=_parse_require_permission(
+                data.get("requirePermission"), f"server {name!r}"),
         )
 
     def merged_env(self) -> dict[str, str]:
@@ -68,11 +75,26 @@ class ServerConfig:
 
 
 @dataclass
+class PermissionConfig:
+    """Client-wide (global) permission requirements, applied across all servers.
+
+    A tool needs human approval before it runs when **either** side asks for it —
+    the server that owns the tool (via its MCP metadata) **or** the client (here
+    / per-server config). This holds only the client's *global* rules; per-server
+    rules live on each :class:`ServerConfig.require_permission`.
+    """
+
+    all_tools: bool = False                    # requirePermission: true  → gate everything
+    tools: set[str] = field(default_factory=set)  # requirePermission: [names] → gate these
+
+
+@dataclass
 class ClientConfig:
     """Everything read from a client config file."""
 
     servers: dict[str, ServerConfig] = field(default_factory=dict)
     system_prompt: str | None = None  # overrides the built-in SYSTEM_PROMPT when set
+    permissions: PermissionConfig = field(default_factory=PermissionConfig)
 
 
 def load_config(config_path: str | os.PathLike) -> ClientConfig:
@@ -96,7 +118,34 @@ def load_config(config_path: str | os.PathLike) -> ClientConfig:
     return ClientConfig(
         servers={name: ServerConfig.from_dict(name, cfg) for name, cfg in servers.items()},
         system_prompt=_parse_system_prompt(raw.get("systemPrompt")),
+        permissions=_parse_permissions(raw.get("requirePermission")),
     )
+
+
+def _parse_require_permission(value: Any, where: str) -> bool | set[str]:
+    """Normalize a ``requirePermission`` value: bool, or a list of tool names.
+
+    ``True``/``False`` gate all/none of the relevant tools; a list names the tools
+    (by their un-namespaced name) that need approval. Anything else is an error.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, list):
+        return {str(v) for v in value}
+    raise ValueError(
+        f"'requirePermission' for {where} must be true/false or a list of tool names")
+
+
+def _parse_permissions(value: Any) -> PermissionConfig:
+    """Parse the top-level (global) ``requirePermission`` into a PermissionConfig."""
+    rp = _parse_require_permission(value, "the client")
+    if rp is True:
+        return PermissionConfig(all_tools=True)
+    if isinstance(rp, set):
+        return PermissionConfig(tools=rp)
+    return PermissionConfig()
 
 
 def load_servers(config_path: str | os.PathLike) -> dict[str, ServerConfig]:

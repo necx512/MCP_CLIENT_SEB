@@ -91,6 +91,8 @@ class Repl:
         self._spawn_settings = spawn_settings or SpawnSettings()
         # Offer spawn_subagent to the LLM as a local tool (mirrors /spawn).
         install_spawn_tool(self.manager, self._spawn_settings)
+        # This REPL is the human approver for permission-gated tool calls.
+        self.manager.permission_prompt = self._ask_permission
         self._init_agent()
 
     def _init_agent(self) -> None:
@@ -128,7 +130,8 @@ class Repl:
                 continue
             summary = t.description.strip().splitlines()[0] if t.description.strip() else ""
             origin = t.server or "local"
-            print(f"  {c(t.exposed_name, 'cyan')} {c('(' + origin + ')', 'dim')}")
+            lock = c(" 🔒", "yellow") if t.requires_permission else ""
+            print(f"  {c(t.exposed_name, 'cyan')} {c('(' + origin + ')', 'dim')}{lock}")
             if summary:
                 print(f"      {summary}")
             shown += 1
@@ -200,6 +203,33 @@ class Repl:
             await self.agent.send(text, self._on_event)
         except Exception as e:  # noqa: BLE001
             print(c(f"\n  Chat error: {type(e).__name__}: {e}", "red"))
+
+    async def _ask_permission(self, ref, arguments) -> bool:
+        """Approve/deny a permission-gated tool call. Backs manager.permission_prompt.
+
+        Runs the blocking prompt in a thread (like the main REPL input) so the
+        event loop keeps turning. Default (empty answer) is **no** — fail safe.
+        """
+        origin = ref.server or "local"
+        preview = json.dumps(arguments)
+        if len(preview) > 300:
+            preview = preview[:300] + "…"
+        print(c(f"\n  🔒 permission required — {ref.exposed_name} ({origin})", "yellow", "bold"))
+        print(c(f"     args: {preview}", "dim"))
+        while True:
+            ans = await asyncio.to_thread(
+                input, c("     allow? [y]es once / [n]o / [a]lways this session: ", "yellow"))
+            ans = ans.strip().lower()
+            if ans in ("y", "yes"):
+                return True
+            if ans in ("", "n", "no"):
+                print(c("     denied.", "dim"))
+                return False
+            if ans in ("a", "always"):
+                self.manager.always_allow.add(ref.exposed_name)
+                print(c(f"     always allowing {ref.exposed_name!r} this session.", "dim"))
+                return True
+            print(c("     please answer y, n, or a.", "dim"))
 
     def _on_event(self, kind: str, payload) -> None:
         if kind == "thinking":
@@ -363,7 +393,7 @@ async def _amain(argv: list[str] | None = None) -> int:
     servers = client_cfg.servers
 
     print(c(f"Connecting to {len(servers)} MCP server(s) from {config} …", "dim"))
-    async with MCPManager(servers) as manager:
+    async with MCPManager(servers, permissions=client_cfg.permissions) as manager:
         if not manager.sessions:
             if servers:
                 print(c("No servers connected. Check /servers output and your config.", "red"))
