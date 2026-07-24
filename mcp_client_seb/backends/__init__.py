@@ -12,19 +12,22 @@ from ..manager import MCPManager
 from .anthropic_backend import AnthropicAgent
 from .base import BackendError, BackendUnavailable, BaseAgent, ChatSettings
 from .ollama_backend import OllamaAgent
+from .vllm_backend import VLLMAgent
 
 #: All selectable backends, by id.
 BACKENDS: dict[str, type[BaseAgent]] = {
     "anthropic": AnthropicAgent,
     "ollama": OllamaAgent,
+    "vllm": VLLMAgent,
 }
 
 #: Order tried when backend == "auto".
-AUTO_ORDER: list[str] = ["anthropic", "ollama"]
+AUTO_ORDER: list[str] = ["anthropic", "ollama", "vllm"]
 
 __all__ = [
     "AnthropicAgent",
     "OllamaAgent",
+    "VLLMAgent",
     "BaseAgent",
     "ChatSettings",
     "BackendError",

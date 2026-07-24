@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 
 from . import __version__
@@ -38,6 +39,15 @@ def c(text: str, *styles: str) -> str:
     if not sys.stdout.isatty():
         return text
     return "".join(_C[s] for s in styles) + text + _C["reset"]
+
+
+def _flush_stdin() -> None:
+    """Drop any unread terminal input (POSIX tty only; a no-op elsewhere)."""
+    try:
+        import termios  # noqa: PLC0415 — POSIX-only, imported lazily
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:  # noqa: BLE001 — not a tty / not POSIX / redirected: skip
+        pass
 
 
 HELP = f"""
@@ -214,6 +224,10 @@ class Repl:
         preview = json.dumps(arguments)
         if len(preview) > 300:
             preview = preview[:300] + "…"
+        # Discard any type-ahead buffered while the model was generating: a
+        # security decision must be a fresh, deliberate keystroke, never a stray
+        # newline that would otherwise read as "" and auto-deny.
+        _flush_stdin()
         print(c(f"\n  🔒 permission required — {ref.exposed_name} ({origin})", "yellow", "bold"))
         print(c(f"     args: {preview}", "dim"))
         while True:
@@ -246,6 +260,10 @@ class Repl:
             tag = "error" if payload["is_error"] else "ok"
             style = "red" if payload["is_error"] else "dim"
             print(c(f"    ↳ [{tag}] {preview}", style))
+        elif kind == "error":
+            # Backend/loop failures (bad request, refusal, iteration cap) arrive
+            # here; without this branch they'd be silently swallowed.
+            print(c(f"  ⚠ {payload}", "red"))
 
     # -- loop --------------------------------------------------------------
 
@@ -326,14 +344,15 @@ async def _amain(argv: list[str] | None = None) -> int:
              "spawn_subagent tool, not run by hand.",
     )
     parser.add_argument(
-        "--backend", "-b", choices=["auto", "anthropic", "ollama"], default="auto",
+        "--backend", "-b", choices=["auto", "anthropic", "ollama", "vllm"], default="auto",
         help="LLM backend for chat mode. 'auto' prefers Anthropic (if a key is "
-             "set), else Ollama (default: auto).",
+             "set), then a local Ollama, then a vLLM server (default: auto).",
     )
     parser.add_argument(
         "--model", "-m", default=None,
-        help="Model to use for chat. Ollama backend only; defaults to "
-             "$OLLAMA_MODEL or 'llama3.1'. (Anthropic model is set in agent.py.)",
+        help="Model to use for chat (Ollama and vLLM backends). Ollama defaults to "
+             "$OLLAMA_MODEL or 'llama3.1'; vLLM to $VLLM_MODEL or the first model "
+             "the server advertises. (The Anthropic model is fixed in its backend.)",
     )
     parser.add_argument(
         "--ollama-host", default=None,
@@ -355,6 +374,16 @@ async def _amain(argv: list[str] | None = None) -> int:
              "0 (unload now). Default: unset (Ollama's own default, ~5m). Use -1 to keep a "
              "remote model resident and avoid reloads. Also reads $OLLAMA_KEEP_ALIVE.",
     )
+    parser.add_argument(
+        "--vllm-host", default=None,
+        help="vLLM server URL (default: $VLLM_HOST or http://localhost:8000). vLLM speaks "
+             "the OpenAI-compatible API at /v1.",
+    )
+    parser.add_argument(
+        "--vllm-api-key", default=None,
+        help="Bearer token for the vLLM server (default: $VLLM_API_KEY or $OPENAI_API_KEY). "
+             "Optional; matches the server's --api-key when it was started with one.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     args = parser.parse_args(argv)
 
@@ -364,8 +393,23 @@ async def _amain(argv: list[str] | None = None) -> int:
     )
 
     think = {"on": True, "off": False}.get(args.ollama_think)  # "auto" -> None
-    settings = ChatSettings(model=args.model, host=args.ollama_host,
-                            api_key=args.ollama_api_key, think=think,
+    # host/api_key are generic ChatSettings fields; route the right per-backend
+    # flags into them. In 'auto' each backend still falls back to its own env
+    # var / default when the flag is unset (host stays None here).
+    if args.backend == "vllm":
+        chat_host, chat_api_key = args.vllm_host, args.vllm_api_key
+    else:
+        chat_host, chat_api_key = args.ollama_host, args.ollama_api_key
+    # Subagents are child processes that inherit this environment. A key given on
+    # the CLI isn't in it yet, so publish it here — via env, never argv (argv is
+    # visible in ps) — so spawned subagents can reach the same backend. Inherited
+    # by children to any depth. Only sets what was actually passed.
+    for var, val in (("VLLM_API_KEY", args.vllm_api_key),
+                     ("OLLAMA_API_KEY", args.ollama_api_key)):
+        if val:
+            os.environ[var] = val
+    settings = ChatSettings(model=args.model, host=chat_host,
+                            api_key=chat_api_key, think=think,
                             keep_alive=args.ollama_keep_alive)
     # How subagents are launched: same interpreter + backend choice, no --config
     # (they start empty and are configured dynamically). Keys flow via env.
@@ -400,7 +444,7 @@ async def _amain(argv: list[str] | None = None) -> int:
             else:
                 print(c("No MCP servers configured — chat and /spawn still work.", "dim"))
         repl = Repl(manager, backend=args.backend, model=args.model,
-                    host=args.ollama_host, api_key=args.ollama_api_key,
+                    host=chat_host, api_key=chat_api_key,
                     think=think, keep_alive=args.ollama_keep_alive,
                     system_prompt=client_cfg.system_prompt,
                     spawn_settings=spawn_settings)
@@ -425,6 +469,8 @@ def _serve_arg_tail(args) -> list[str]:
         tail += ["--ollama-think", args.ollama_think]
     if args.ollama_keep_alive:
         tail += ["--ollama-keep-alive", args.ollama_keep_alive]
+    if args.vllm_host:
+        tail += ["--vllm-host", args.vllm_host]
     return tail
 
 
