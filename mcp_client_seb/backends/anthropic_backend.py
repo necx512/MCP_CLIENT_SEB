@@ -67,12 +67,13 @@ class AnthropicAgent(BaseAgent):
         try:
             # Recomputed each turn so tools added mid-conversation (e.g. a freshly
             # spawned subagent's tools) are offered on the very next model call.
+            # ``_request_tools`` also lets the interceptor override them for a turn.
             response = self._client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
                 system=self.system_prompt,
                 thinking={"type": "adaptive", "display": "summarized"},
-                tools=self._tool_specs(),
+                tools=self._request_tools(),
                 messages=self._messages,
             )
         except Exception as e:  # noqa: BLE001 — surface SDK/network errors to the loop

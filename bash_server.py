@@ -44,7 +44,7 @@ def run_bash(command: str, timeout: float = 30.0) -> str:
 mcp.add_tool(
     run_bash,
     name="run_bash",
-    description="Execute a bash command on the host and return its output.",
+    description="Execute a bash command on the host and return its output. Use this tool only if no other tool allow you to do what you want",
     # Two ways to say the same thing; a client only needs to read one:
     annotations=ToolAnnotations(destructiveHint=True, requiresPermission=True),
     meta={"requiresPermission": True},

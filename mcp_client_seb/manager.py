@@ -105,6 +105,9 @@ class MCPManager:
         """
         if cfg.name in self.sessions or cfg.name in self._conn_tasks:
             raise ValueError(f"a server named {cfg.name!r} is already connected")
+        # An explicit prefix (e.g. from spawn_subagent) wins; otherwise honour the
+        # server's own configured prefix so static entries can namespace too.
+        prefix = prefix or cfg.prefix
         before = set(self.tools)
         ready: asyncio.Future = asyncio.get_running_loop().create_future()
         self._shutdown[cfg.name] = asyncio.Event()

@@ -337,6 +337,10 @@ filesystem server via `npx`:
 Restart the client. `/servers` now shows both, and their tools are merged into
 one namespace. If two servers expose a tool with the same name, the second is
 automatically renamed `server__tool` (e.g. `files__read`) so both stay callable.
+To namespace a server's tools up front (not just on collision), give it a
+`prefix`: `"prefix": "scout"` exposes every tool as `scout__<tool>`. This is the
+way to give a statically-configured subagent tidy `scout__ask` / `scout__reset`
+names instead of bare ones.
 
 ---
 
@@ -351,6 +355,7 @@ automatically renamed `server__tool` (e.g. `files__read`) so both stay callable.
 | `cwd` | — | Working directory for the server process. |
 | `env` | — | Extra env vars (layered on top of your current environment). |
 | `requirePermission` | — | Gate this server's tools behind human approval: `true` (all), `false`/omitted (none), or a list of tool names. See [§14](#14-tool-permissions-approve-before-running). |
+| `prefix` | — | Namespace this server's tools as `<prefix>__<tool>`. Opt-in; most servers keep bare names. Use it to disambiguate a statically-configured subagent (`"prefix": "scout"` → `scout__ask`) or two servers sharing tool names. |
 
 **Command-line flags:**
 
@@ -508,6 +513,26 @@ A subagent's **system prompt is fixed at spawn time**, delivered through its
 config file's `systemPrompt` key (created on the fly when you pass a prompt to
 `/spawn` or `spawn_subagent`). There is no runtime re-steering tool — to change
 it, respawn the subagent or edit its config.
+
+**Telling the parent what a subagent is for.** The parent's LLM only sees the
+subagent's `ask` tool — so it can only route work to the right subagent if that
+tool's *description* says what the subagent specialises in. Add a one-line
+`description` to the subagent's config and it's woven into the `ask` description
+the parent receives:
+
+```json
+{
+  "description": "Scout: a binary reverse-engineering specialist. Give it a path; it triages the binary and reports mitigations, dangerous imports, and exploitability.",
+  "systemPrompt": "You are Scout, a focused binary RE subagent …",
+  "mcpServers": { ... }
+}
+```
+
+Without a `description`, the subagent falls back to a trimmed `systemPrompt`
+(so `/spawn worker <prompt>` already gives the parent *something* to route on),
+and with neither it uses a generic "delegate a task" description. The
+`systemPrompt` still steers the subagent's own reasoning; `description` is purely
+the outward-facing blurb the parent sees.
 
 ### Two ways to spawn
 
@@ -676,3 +701,6 @@ servers/tools it's allowed to run unattended.
 - `curl -fsSL https://ollama.com/install.sh | sh`
 - `systemctl start ollama`
 - `ollama pull llama3.1`
+
+# TESTING PROMPT
+Can you create a subagent. Its config file is at /home/debian/IA/MCP_CLIENT_SEB/web.json

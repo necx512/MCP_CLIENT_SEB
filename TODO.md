@@ -1,1 +1,3 @@
-Ajouter cache
+- Ajouter cache
+- Quand un agent est configurer dans un fichier de conf et pas créé dynamiquement, il n'est pas possible de le kill : a changer!
+- Quand je me connect sans X11 (ssh sans -Y) et que je veux utiliser l'agent web, il y a plein d'erreur qui s'affiche mais il me dit que l'agent est dispo a la fin

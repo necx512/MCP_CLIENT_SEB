@@ -62,7 +62,52 @@ class _Subagent:
         return self.agent
 
 
-def _build_mcp(state: _Subagent):
+def _agent_specialty(description: str | None, system_prompt: str | None) -> str:
+    """What this subagent is *for*, as the parent should understand it.
+
+    A config ``description`` if given (the clean path), else a trimmed
+    ``systemPrompt`` (works for ``/spawn`` too, since that bakes the prompt into
+    the config), else empty.
+    """
+    return (description or "").strip() or _trim(system_prompt, 400)
+
+
+def _tool_descriptions(specialty: str) -> dict[str, str]:
+    """Descriptions for the four subagent tools, all carrying its identity.
+
+    The parent only sees these tools — and when several subagents are connected
+    (bare, un-prefixed names via static config), the descriptions are the only
+    way to tell whose ``ask`` / ``connect_server`` / … is whose. So every tool
+    names the subagent's role, not just ``ask``.
+    """
+    tag = f" (This subagent's role: {_trim(specialty, 140)})" if specialty else ""
+    if specialty:
+        ask = (f"Delegate a task to this subagent. Its role: {specialty} "
+               "It reasons with its own LLM and tools, then returns its answer.")
+    else:
+        ask = ("Delegate a task to this subagent; it reasons with its own LLM "
+               "and tools, then returns its answer.")
+    return {
+        "ask": ask,
+        "connect_server": ("Connect this subagent to a new stdio MCP server; its "
+                           "tools then become available to this subagent's ask." + tag),
+        "list_tools": "List the MCP tools this subagent currently has." + tag,
+        "reset": ("Start this subagent on a fresh conversation "
+                  "(keeps its servers and system prompt)." + tag),
+    }
+
+
+def _trim(text: str | None, limit: int) -> str:
+    """Collapse whitespace and cap ``text`` at ``limit`` chars (word boundary)."""
+    if not text:
+        return ""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip() + "…"
+
+
+def _build_mcp(state: _Subagent, descriptions: dict[str, str]):
     from mcp.server.fastmcp import FastMCP  # noqa: PLC0415 — only needed in serve mode
 
     mcp = FastMCP("mcp_client_seb")
@@ -126,14 +171,12 @@ def _build_mcp(state: _Subagent):
             state.agent.reset()
         return "Subagent conversation reset."
 
-    mcp.add_tool(ask, name="ask",
-                 description="Delegate a task to this subagent; returns its answer.")
+    mcp.add_tool(ask, name="ask", description=descriptions["ask"])
     mcp.add_tool(connect_server, name="connect_server",
-                 description="Connect the subagent to a new stdio MCP server.")
+                 description=descriptions["connect_server"])
     mcp.add_tool(list_tools, name="list_tools",
-                 description="List the tools the subagent currently has.")
-    mcp.add_tool(reset, name="reset",
-                 description="Reset the subagent's conversation.")
+                 description=descriptions["list_tools"])
+    mcp.add_tool(reset, name="reset", description=descriptions["reset"])
     return mcp
 
 
@@ -153,7 +196,8 @@ async def serve(
         # A subagent can itself spawn sub-subagents, so it also gets the local tool.
         install_spawn_tool(manager, spawn_settings)
         state = _Subagent(manager, backend, settings)
-        mcp = _build_mcp(state)
+        specialty = _agent_specialty(client_cfg.description, client_cfg.system_prompt)
+        mcp = _build_mcp(state, _tool_descriptions(specialty))
         logger.info("subagent serving over stdio (%d preconfigured server(s))", len(manager.sessions))
         await mcp.run_stdio_async()
     return 0

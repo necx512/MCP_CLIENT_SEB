@@ -30,9 +30,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+#: A namespace prefix must make a clean tool name: ``<prefix>__<tool>``.
+_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 
 @dataclass
@@ -49,6 +53,11 @@ class ServerConfig:
     #: set of tool names (original, un-namespaced) that need it. This is OR-ed
     #: with whatever the server itself declares — see :class:`PermissionConfig`.
     require_permission: bool | set[str] = False
+    #: Optional namespace for this server's tools: every tool is exposed as
+    #: ``<prefix>__<tool>``. Opt-in — most servers keep their clean bare names;
+    #: set it to disambiguate a subagent (``scout__ask``) or two servers that
+    #: share tool names. ``None`` = no prefix (bare, namespaced only on collision).
+    prefix: str | None = None
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "ServerConfig":
@@ -62,6 +71,7 @@ class ServerConfig:
             cwd=data.get("cwd"),
             require_permission=_parse_require_permission(
                 data.get("requirePermission"), f"server {name!r}"),
+            prefix=_parse_prefix(data.get("prefix"), f"server {name!r}"),
         )
 
     def merged_env(self) -> dict[str, str]:
@@ -95,6 +105,10 @@ class ClientConfig:
     servers: dict[str, ServerConfig] = field(default_factory=dict)
     system_prompt: str | None = None  # overrides the built-in SYSTEM_PROMPT when set
     permissions: PermissionConfig = field(default_factory=PermissionConfig)
+    #: A one-line summary of what this (sub)agent is for. In ``--serve`` mode it's
+    #: woven into the ``ask`` tool's description so a *parent* agent can see what
+    #: the subagent specialises in and route work to it. Ignored in REPL mode.
+    description: str | None = None
 
 
 def load_config(config_path: str | os.PathLike) -> ClientConfig:
@@ -119,7 +133,32 @@ def load_config(config_path: str | os.PathLike) -> ClientConfig:
         servers={name: ServerConfig.from_dict(name, cfg) for name, cfg in servers.items()},
         system_prompt=_parse_system_prompt(raw.get("systemPrompt")),
         permissions=_parse_permissions(raw.get("requirePermission")),
+        description=_parse_description(raw.get("description")),
     )
+
+
+def _parse_prefix(value: Any, where: str) -> str | None:
+    """Normalize/validate an optional tool-namespace ``prefix`` for a server."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"'prefix' for {where} must be a string")
+    value = value.strip()
+    if not value:
+        return None
+    if not _PREFIX_RE.match(value):
+        raise ValueError(f"'prefix' for {where} must be letters/digits/_/- "
+                         "and start with a letter")
+    return value
+
+
+def _parse_description(value: Any) -> str | None:
+    """Normalize the optional top-level ``description`` (a plain one-liner)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    raise ValueError("'description' must be a string")
 
 
 def _parse_require_permission(value: Any, where: str) -> bool | set[str]:

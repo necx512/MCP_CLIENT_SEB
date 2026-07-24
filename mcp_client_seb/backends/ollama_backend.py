@@ -175,7 +175,7 @@ class OllamaAgent(BaseAgent):
             payload["keep_alive"] = self._keep_alive
         if self._think is not None:
             payload["think"] = self._think  # False = skip the model's <think> phase (much faster)
-        tools = self._tool_specs()  # recomputed each turn (see AnthropicAgent._complete)
+        tools = self._request_tools()  # recomputed each turn; interceptor may override
         if tools:
             payload["tools"] = tools
         try:

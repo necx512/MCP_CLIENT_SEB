@@ -141,6 +141,10 @@ class BaseAgent(ABC):
         #: Overridden by ``build_agent`` from a config file's ``systemPrompt``.
         self.system_prompt = SYSTEM_PROMPT
         self._messages: list[Any] = []
+        #: A one-shot tool-list override set by the interceptor when a human edits
+        #: the ``tools`` of a paused request. Consumed by the next ``_complete``
+        #: (see ``_request_tools``); ``None`` means "use the live tool registry".
+        self._tools_override: list[Any] | None = None
         try:
             label = self.label
         except Exception:  # noqa: BLE001 — identity is cosmetic; never block startup
@@ -164,6 +168,15 @@ class BaseAgent(ABC):
         """Human-readable backend + model, e.g. ``Ollama (llama3.1)``."""
 
     # -- provider-specific hooks -------------------------------------------
+
+    @abstractmethod
+    def _tool_specs(self) -> list[Any]:
+        """The MCP tools in this provider's wire schema, sent with each request.
+
+        Recomputed per turn from the live tool registry so tools added
+        mid-conversation (e.g. a freshly spawned subagent's) appear on the next
+        call. Also shown to the interceptor at the ``request`` point.
+        """
 
     @abstractmethod
     def _complete(self) -> Turn:
@@ -201,6 +214,20 @@ class BaseAgent(ABC):
 
     def _tool_refs(self) -> list[ToolRef]:
         return list(self._manager.tools.values())
+
+    def _request_tools(self) -> list[Any]:
+        """Tool specs for the next model call — honouring an interceptor edit.
+
+        Normally the live tool list (``_tool_specs``). If a human edited the
+        ``tools`` of a paused request, use that instead for this one call, then
+        fall back to the live list (tools are derived state, not stored history,
+        so an override can't sensibly persist across turns).
+        """
+        if self._tools_override is not None:
+            tools = self._tools_override
+            self._tools_override = None
+            return tools
+        return self._tool_specs()
 
     def _add_user(self, text: str) -> None:
         self._messages.append({"role": "user", "content": text})
@@ -298,9 +325,14 @@ class BaseAgent(ABC):
 
     async def _intercept_request(self, on_event) -> bool:
         """Pause before the model call. Returns False if the turn was dropped."""
+        # Include the tools actually sent this turn so the interceptor shows the
+        # whole outgoing request (system + tools + messages), as a proxy would.
+        tool_specs = self._tool_specs()
         verdict = await self._intercept.intercept(
             "request",
-            {"system": self.system_prompt, "messages": jsonify(self._messages)})
+            {"system": self.system_prompt,
+             "tools": tool_specs,
+             "messages": jsonify(self._messages)})
         if verdict.dropped:
             on_event("error", "Request dropped at the interceptor.")
             return False
@@ -308,8 +340,11 @@ class BaseAgent(ABC):
             # Edits land in history, not just this call: ``_messages`` *is* the
             # conversation. That differs from Burp, where editing a request
             # leaves the browser's own state untouched — here it's how you steer.
+            # ``tools`` are derived per turn, so an edit applies to this call only
+            # (see ``_request_tools``), while system/messages edits persist.
             self.system_prompt = verdict.payload.get("system", self.system_prompt)
             self._messages = verdict.payload.get("messages", self._messages)
+            self._tools_override = verdict.payload.get("tools", tool_specs)
         return True
 
     async def _intercept_response(self, turn: Turn, on_event) -> Turn | None:
