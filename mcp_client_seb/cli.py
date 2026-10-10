@@ -1,6 +1,17 @@
-"""Interactive REPL entry point.
+"""REPL entry point — every agent, root or subagent, runs this same REPL.
 
-Two modes, always available in the same session:
+Front or back is detected, not configured: the one process whose stdin is a
+terminal is **front** and reads its prompts from the keyboard. Every other one
+(a subagent, whose stdin is its parent's MCP pipe) is **back**: it serves MCP
+over stdio and its prompts arrive through the ``ask`` tool (see
+:mod:`mcp_client_seb.server`). Either way a prompt goes through the same
+:meth:`Repl.handle`, so ``ask`` accepts slash commands too.
+
+What differs is who decides. A permission-gated tool call is approved at the
+keyboard in front; in back it's escalated to the parent as an MCP elicitation,
+which relays it up until it reaches the front.
+
+Two kinds of input, always available in the same session:
 
 * **Slash commands** — inspect and drive the MCP servers with no LLM:
   ``/servers``, ``/tools``, ``/schema``, ``/call``. These work even without the
@@ -20,11 +31,15 @@ import logging
 import os
 import sys
 
+from mcp import types
+
 from . import __version__
 from .backends import BackendUnavailable, BaseAgent, ChatSettings, build_agent
-from .config import default_config_path, load_config
-from .manager import MCPManager, parts_to_text
+from .config import ClientConfig, default_config_path, load_config
+from .manager import MCPManager, ToolRef, parts_to_text
 from .subagent import SpawnSettings, install_spawn_tool, remove_subagent, spawn_subagent
+
+logger = logging.getLogger("mcp_client_seb.cli")
 
 # -- tiny ANSI helpers (no third-party deps) -------------------------------
 
@@ -48,6 +63,40 @@ def _flush_stdin() -> None:
         termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
     except Exception:  # noqa: BLE001 — not a tty / not POSIX / redirected: skip
         pass
+
+
+# -- permission requests (shared by front and back) ------------------------
+
+#: A permission request travels up the subagent chain as an MCP elicitation
+#: with this schema. The message's first line names the tool; each agent that
+#: relays it prefixes its child's name, so the front sees ``worker/scout/tool``.
+DECISIONS = ("yes", "no", "always")
+PERMISSION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {
+            "type": "string",
+            "enum": list(DECISIONS),
+            "description": "yes = allow once, no = deny, always = allow for the session",
+        },
+    },
+    "required": ["decision"],
+}
+
+
+def _is_permission_request(params: object) -> bool:
+    schema = getattr(params, "requestedSchema", None) or {}
+    try:
+        return schema["properties"]["decision"]["enum"] == list(DECISIONS)
+    except (KeyError, TypeError):
+        return False
+
+
+def _permission_message(ref: ToolRef, arguments: dict) -> str:
+    preview = json.dumps(arguments)
+    if len(preview) > 300:
+        preview = preview[:300] + "…"
+    return f"{ref.exposed_name} ({ref.server or 'local'})\nargs: {preview}"
 
 
 HELP = f"""
@@ -77,6 +126,7 @@ class Repl:
         self,
         manager: MCPManager,
         *,
+        front: bool = True,
         backend: str = "auto",
         model: str | None = None,
         host: str | None = None,
@@ -87,6 +137,13 @@ class Repl:
         spawn_settings: SpawnSettings | None = None,
     ):
         self.manager = manager
+        #: Front reads the keyboard and prints; back is driven by ``ask`` and
+        #: collects its output into the tool's answer (see :meth:`submit`).
+        self.front = front
+        self._sink: list[str] | None = None   # back: output of the current ask
+        self._trace: list[str] = []           # back: tool activity of the current ask
+        self._ask_ctx = None                  # back: MCP context of the current ask
+        self._lock = asyncio.Lock()           # back: one ask at a time
         self.agent: BaseAgent | None = None
         self.agent_error: str | None = None
         self.backend_label: str | None = None
@@ -101,9 +158,24 @@ class Repl:
         self._spawn_settings = spawn_settings or SpawnSettings()
         # Offer spawn_subagent to the LLM as a local tool (mirrors /spawn).
         install_spawn_tool(self.manager, self._spawn_settings)
-        # This REPL is the human approver for permission-gated tool calls.
-        self.manager.permission_prompt = self._ask_permission
+        # Who approves permission-gated calls — ours and our subagents'.
+        if front:
+            self.manager.permission_prompt = self._ask_permission
+            self.manager.elicit_handler = self._ask_elicitation
+        else:
+            self.manager.permission_prompt = self._escalate_permission
+            self.manager.elicit_handler = self._relay_elicitation
         self._init_agent()
+
+    def out(self, text: str = "") -> None:
+        """Print in front. In back, stdout is the MCP pipe: collect into the
+        current ``ask``'s answer instead, or log if no ask is running."""
+        if self.front:
+            print(text)
+        elif self._sink is not None:
+            self._sink.append(text)
+        elif text.strip():
+            logger.info(text)
 
     def _init_agent(self) -> None:
         """Select a chat backend per --backend (or auto-detect)."""
@@ -118,7 +190,7 @@ class Repl:
         self.agent.show_thinking = self.show_thinking
         self.backend_label = self.agent.label
         if self.agent.warning:
-            print(c(f"  Note: {self.agent.warning}", "yellow"))
+            self.out(c(f"  Note: {self.agent.warning}", "yellow"))
 
     # -- command handlers --------------------------------------------------
 
@@ -127,10 +199,10 @@ class Repl:
             connected = name in self.manager.sessions
             n_tools = sum(1 for t in self.manager.tools.values() if t.server == name)
             status = c("connected", "green") if connected else c("FAILED", "red")
-            print(f"  {c(name, 'bold')}  [{status}]  {n_tools} tools  "
+            self.out(f"  {c(name, 'bold')}  [{status}]  {n_tools} tools  "
                   f"{c(cfg.command + ' ' + ' '.join(cfg.args), 'dim')}")
             if name in self.manager.connect_errors:
-                print(f"      {c(self.manager.connect_errors[name], 'red')}")
+                self.out(f"      {c(self.manager.connect_errors[name], 'red')}")
 
     def cmd_tools(self, arg: str) -> None:
         flt = arg.strip().lower()
@@ -141,166 +213,255 @@ class Repl:
             summary = t.description.strip().splitlines()[0] if t.description.strip() else ""
             origin = t.server or "local"
             lock = c(" 🔒", "yellow") if t.requires_permission else ""
-            print(f"  {c(t.exposed_name, 'cyan')} {c('(' + origin + ')', 'dim')}{lock}")
+            self.out(f"  {c(t.exposed_name, 'cyan')} {c('(' + origin + ')', 'dim')}{lock}")
             if summary:
-                print(f"      {summary}")
+                self.out(f"      {summary}")
             shown += 1
-        print(c(f"  {shown} tool(s)", "dim"))
+        self.out(c(f"  {shown} tool(s)", "dim"))
 
     def cmd_schema(self, arg: str) -> None:
         name = arg.strip()
         ref = self.manager.tools.get(name)
         if not ref:
-            print(c(f"  Unknown tool: {name!r} (try /tools)", "red"))
+            self.out(c(f"  Unknown tool: {name!r} (try /tools)", "red"))
             return
-        print(c(f"  {ref.exposed_name}  —  {ref.description.strip()}", "bold"))
-        print(json.dumps(ref.input_schema, indent=2))
+        self.out(c(f"  {ref.exposed_name}  —  {ref.description.strip()}", "bold"))
+        self.out(json.dumps(ref.input_schema, indent=2))
 
     async def cmd_call(self, arg: str) -> None:
         parts = arg.strip().split(maxsplit=1)
         if not parts:
-            print(c("  Usage: /call <tool> [json-args]", "yellow"))
+            self.out(c("  Usage: /call <tool> [json-args]", "yellow"))
             return
         name = parts[0]
         args_json = parts[1] if len(parts) > 1 else "{}"
         try:
             arguments = json.loads(args_json)
         except json.JSONDecodeError as e:
-            print(c(f"  Invalid JSON arguments: {e}", "red"))
+            self.out(c(f"  Invalid JSON arguments: {e}", "red"))
             return
-        print(c(f"  → calling {name} …", "dim"))
+        self.out(c(f"  → calling {name} …", "dim"))
         content, is_error = await self.manager.call_tool(name, arguments)
         style = "red" if is_error else "green"
-        print(c(f"  [{'error' if is_error else 'ok'}]", style))
-        print(parts_to_text(content))
+        self.out(c(f"  [{'error' if is_error else 'ok'}]", style))
+        self.out(parts_to_text(content))
 
     async def cmd_spawn(self, arg: str) -> None:
         tokens = arg.strip().split()
         if not tokens:
-            print(c("  Usage: /spawn <name> [-c <config.json>] [system prompt]", "yellow"))
+            self.out(c("  Usage: /spawn <name> [-c <config.json>] [system prompt]", "yellow"))
             return
         name = tokens[0]
         rest = tokens[1:]
         config = None
         if rest and rest[0] in ("-c", "--config"):
             if len(rest) < 2:
-                print(c("  Usage: /spawn <name> [-c <config.json>] [system prompt]", "yellow"))
+                self.out(c("  Usage: /spawn <name> [-c <config.json>] [system prompt]", "yellow"))
                 return
             config = rest[1]
             rest = rest[2:]
         system_prompt = " ".join(rest) if rest else None
-        print(c(f"  → spawning subagent {name!r} …", "dim"))
+        self.out(c(f"  → spawning subagent {name!r} …", "dim"))
         content, is_error = await spawn_subagent(
             self.manager, name, self._spawn_settings, system_prompt, config)
-        print(c(parts_to_text(content), "red" if is_error else "green"))
+        self.out(c(parts_to_text(content), "red" if is_error else "green"))
 
     async def cmd_kill(self, arg: str) -> None:
         name = arg.strip().split()[0] if arg.strip() else ""
         if not name:
-            print(c("  Usage: /kill <name>", "yellow"))
+            self.out(c("  Usage: /kill <name>", "yellow"))
             return
-        print(c(f"  → removing subagent {name!r} …", "dim"))
+        self.out(c(f"  → removing subagent {name!r} …", "dim"))
         content, is_error = await remove_subagent(self.manager, name)
-        print(c(parts_to_text(content), "red" if is_error else "green"))
+        self.out(c(parts_to_text(content), "red" if is_error else "green"))
 
     async def cmd_chat(self, text: str) -> None:
         if self.agent is None:
-            print(c(f"  Chat unavailable: {self.agent_error}", "yellow"))
-            print(c("  You can still use /call to invoke tools directly.", "dim"))
+            self.out(c(f"  Chat unavailable: {self.agent_error}", "yellow"))
+            self.out(c("  You can still use /call to invoke tools directly.", "dim"))
             return
         self.agent.show_thinking = self.show_thinking
         try:
             await self.agent.send(text, self._on_event)
         except Exception as e:  # noqa: BLE001
-            print(c(f"\n  Chat error: {type(e).__name__}: {e}", "red"))
+            self.out(c(f"\n  Chat error: {type(e).__name__}: {e}", "red"))
 
-    async def _ask_permission(self, ref, arguments) -> bool:
-        """Approve/deny a permission-gated tool call. Backs manager.permission_prompt.
+    # -- permissions: front decides at the keyboard ------------------------
+
+    async def _ask_permission(self, ref: ToolRef, arguments: dict) -> bool:
+        """Approve/deny one of our own gated tool calls. Backs manager.permission_prompt."""
+        decision = await self._prompt_decision(_permission_message(ref, arguments))
+        if decision == "always":
+            self.manager.always_allow.add(ref.exposed_name)
+        return decision != "no"
+
+    async def _ask_elicitation(self, server: str, params) -> types.ElicitResult:
+        """A subagent escalated a permission request: let the human decide it.
+
+        The subagent records an "always" itself, against its own tool — so
+        nothing is stored here. Any other kind of elicitation is declined: this
+        client only knows how to render permission requests.
+        """
+        if not _is_permission_request(params):
+            self.out(c(f"  ⚠ {server} asked for input this client can't render — declined.",
+                       "yellow"))
+            return types.ElicitResult(action="decline")
+        decision = await self._prompt_decision(f"{server}/{params.message}")
+        return types.ElicitResult(action="accept", content={"decision": decision})
+
+    async def _prompt_decision(self, message: str) -> str:
+        """Ask y/n/a at the keyboard. Returns one of :data:`DECISIONS`.
 
         Runs the blocking prompt in a thread (like the main REPL input) so the
         event loop keeps turning. Default (empty answer) is **no** — fail safe.
         """
-        origin = ref.server or "local"
-        preview = json.dumps(arguments)
-        if len(preview) > 300:
-            preview = preview[:300] + "…"
+        title, _, detail = message.partition("\n")
         # Discard any type-ahead buffered while the model was generating: a
         # security decision must be a fresh, deliberate keystroke, never a stray
         # newline that would otherwise read as "" and auto-deny.
         _flush_stdin()
-        print(c(f"\n  🔒 permission required — {ref.exposed_name} ({origin})", "yellow", "bold"))
-        print(c(f"     args: {preview}", "dim"))
+        self.out(c(f"\n  🔒 permission required — {title}", "yellow", "bold"))
+        for line in detail.splitlines():
+            self.out(c(f"     {line}", "dim"))
         while True:
             ans = await asyncio.to_thread(
                 input, c("     allow? [y]es once / [n]o / [a]lways this session: ", "yellow"))
             ans = ans.strip().lower()
             if ans in ("y", "yes"):
-                return True
+                return "yes"
             if ans in ("", "n", "no"):
-                print(c("     denied.", "dim"))
-                return False
+                self.out(c("     denied.", "dim"))
+                return "no"
             if ans in ("a", "always"):
-                self.manager.always_allow.add(ref.exposed_name)
-                print(c(f"     always allowing {ref.exposed_name!r} this session.", "dim"))
-                return True
-            print(c("     please answer y, n, or a.", "dim"))
+                self.out(c(f"     always allowing {title} this session.", "dim"))
+                return "always"
+            self.out(c("     please answer y, n, or a.", "dim"))
+
+    # -- permissions: back escalates to whoever sent the ask ---------------
+
+    async def _escalate_permission(self, ref: ToolRef, arguments: dict) -> bool:
+        """Back's manager.permission_prompt: ask our parent, who asks the front."""
+        decision = await self._escalate(_permission_message(ref, arguments))
+        if decision == "always":
+            self.manager.always_allow.add(ref.exposed_name)
+        return decision != "no"
+
+    async def _relay_elicitation(self, server: str, params) -> types.ElicitResult:
+        """A subagent of ours escalated a request: pass it on up, naming it."""
+        if not _is_permission_request(params):
+            return types.ElicitResult(action="decline")
+        decision = await self._escalate(f"{server}/{params.message}")
+        return types.ElicitResult(action="accept", content={"decision": decision})
+
+    async def _escalate(self, message: str) -> str:
+        """Send a permission request to our parent, as part of the running ask.
+
+        No ask running means nobody to ask, and a parent that can't answer
+        elicitations (or errors, or declines) means no — never an implicit yes.
+        """
+        ctx = self._ask_ctx
+        if ctx is None:
+            return "no"
+        try:
+            result = await ctx.session.elicit_form(
+                message, PERMISSION_SCHEMA, related_request_id=ctx.request_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("permission escalation failed: %s", e)
+            return "no"
+        decision = (result.content or {}).get("decision") if result.action == "accept" else None
+        return decision if decision in DECISIONS else "no"
 
     def _on_event(self, kind: str, payload) -> None:
         if kind == "thinking":
-            print(c(f"\n[thinking] {payload}", "dim", "magenta"))
+            self.out(c(f"\n[thinking] {payload}", "dim", "magenta"))
         elif kind == "text":
-            print(payload)
+            self.out(payload)
         elif kind == "tool_call":
             args = json.dumps(payload["input"])
-            print(c(f"  ⚙ {payload['name']}({args})", "dim", "cyan"))
+            if not self.front:
+                # The parent's LLM wants an answer, not a log: keep tool activity
+                # out of it, as a fallback for when no text comes (see submit).
+                self._trace.append(f"[tool] {payload['name']}({args})")
+                return
+            self.out(c(f"  ⚙ {payload['name']}({args})", "dim", "cyan"))
         elif kind == "tool_result":
+            if not self.front:
+                return
             preview = payload["text"].replace("\n", " ")
             if len(preview) > 160:
                 preview = preview[:160] + "…"
             tag = "error" if payload["is_error"] else "ok"
             style = "red" if payload["is_error"] else "dim"
-            print(c(f"    ↳ [{tag}] {preview}", style))
+            self.out(c(f"    ↳ [{tag}] {preview}", style))
         elif kind == "error":
             # Backend/loop failures (bad request, refusal, iteration cap) arrive
             # here; without this branch they'd be silently swallowed.
-            print(c(f"  ⚠ {payload}", "red"))
+            self.out(c(f"  ⚠ {payload}", "red"))
 
     # -- loop --------------------------------------------------------------
 
     async def run(self) -> None:
-        print(HELP)
+        self.out(HELP)
         self.cmd_servers("")
         if self.agent_error:
-            print(c(f"\n  Chat disabled — {self.agent_error}", "yellow"))
-            print(c("  Manual tool access via /call still works.\n", "dim"))
+            self.out(c(f"\n  Chat disabled — {self.agent_error}", "yellow"))
+            self.out(c("  Manual tool access via /call still works.\n", "dim"))
         else:
-            print(c(f"\n  Chat enabled via {self.backend_label}. "
+            self.out(c(f"\n  Chat enabled via {self.backend_label}. "
                     "Type a message or a /command.\n", "green"))
 
         while True:
             try:
                 line = await asyncio.to_thread(input, c("mcp> ", "bold", "green"))
             except (EOFError, KeyboardInterrupt):
-                print()
+                self.out()
+                break
+            if await self.handle(line):
                 break
 
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("/"):
-                if await self._dispatch(line):
-                    break
-            else:
-                await self.cmd_chat(line)
+    async def submit(self, line: str, ctx) -> str:
+        """Back's input: one prompt from the ``ask`` tool, its output as the answer.
+
+        ``ctx`` is the MCP request context of that ask — the channel permission
+        requests are escalated over while it runs.
+        """
+        async with self._lock:
+            self._sink, self._trace, self._ask_ctx = [], [], ctx
+            try:
+                await self.handle(line)
+                answer = "\n".join(t for t in self._sink if t).strip()
+                trace = self._trace
+            finally:
+                self._sink, self._ask_ctx = None, None
+        if not answer:
+            answer = "(subagent produced no text)"
+            if trace:
+                answer += "\nTool activity:\n" + "\n".join(trace)
+        return answer
+
+    async def handle(self, line: str) -> bool:
+        """Run one prompt — keyboard or ``ask``, it's the same. Returns True to quit."""
+        line = line.strip()
+        if not line:
+            return False
+        if line.startswith("/"):
+            return await self._dispatch(line)
+        await self.cmd_chat(line)
+        return False
 
     async def _dispatch(self, line: str) -> bool:
         """Handle a slash command. Returns True to quit."""
         cmd, _, arg = line[1:].partition(" ")
         cmd = cmd.lower()
         if cmd in ("quit", "exit", "q"):
+            if not self.front:
+                # A subagent's lifetime belongs to its parent, not to a prompt.
+                self.out("  /quit is ignored in a subagent — the parent removes it "
+                         "(remove_subagent / /kill).")
+                return False
             return True
         elif cmd == "help":
-            print(HELP)
+            self.out(HELP)
         elif cmd == "servers":
             self.cmd_servers(arg)
         elif cmd == "tools":
@@ -315,13 +476,13 @@ class Repl:
             await self.cmd_kill(arg)
         elif cmd == "thinking":
             self.show_thinking = not self.show_thinking
-            print(c(f"  show reasoning: {self.show_thinking}", "dim"))
+            self.out(c(f"  show reasoning: {self.show_thinking}", "dim"))
         elif cmd == "reset":
             if self.agent:
                 self.agent.reset()
-            print(c("  conversation reset", "dim"))
+            self.out(c("  conversation reset", "dim"))
         else:
-            print(c(f"  Unknown command: /{cmd} (try /help)", "yellow"))
+            self.out(c(f"  Unknown command: /{cmd} (try /help)", "yellow"))
         return False
 
 
@@ -333,15 +494,9 @@ async def _amain(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--config", "-c", default=None,
         help="Path to a config file with an 'mcpServers' object "
-             "(default: servers.json next to the package). In --serve mode, "
-             "omitting this starts the subagent with no servers (add them "
+             "(default: servers.json next to the package). For a subagent (stdin "
+             "not a terminal), omitting this starts it with no servers (add them "
              "dynamically via its connect_server tool).",
-    )
-    parser.add_argument(
-        "--serve", action="store_true",
-        help="Run as an MCP server over stdio (a controllable subagent) instead "
-             "of the interactive REPL. Normally launched for you by /spawn or the "
-             "spawn_subagent tool, not run by hand.",
     )
     parser.add_argument(
         "--backend", "-b", choices=["auto", "anthropic", "ollama", "vllm"], default="auto",
@@ -408,59 +563,56 @@ async def _amain(argv: list[str] | None = None) -> int:
                      ("OLLAMA_API_KEY", args.ollama_api_key)):
         if val:
             os.environ[var] = val
-    settings = ChatSettings(model=args.model, host=chat_host,
-                            api_key=chat_api_key, think=think,
-                            keep_alive=args.ollama_keep_alive)
     # How subagents are launched: same interpreter + backend choice, no --config
     # (they start empty and are configured dynamically). Keys flow via env.
     spawn_settings = SpawnSettings(serve_args=_serve_arg_tail(args))
 
-    if args.serve:
-        # MCP server mode: no stdout chatter (the protocol owns stdout).
-        if args.config:
-            # Carry the config's systemPrompt into settings; serve() re-reads the
-            # file for its servers and will surface any config error itself.
-            try:
-                settings.system_prompt = load_config(args.config).system_prompt
-            except (FileNotFoundError, ValueError):
-                pass
-        from .server import serve  # noqa: PLC0415 — pulls in FastMCP only when serving
-        return await serve(config_path=args.config, backend=args.backend,
-                           settings=settings, spawn_settings=spawn_settings)
+    # Front = the one process at a terminal. A subagent's stdin is its parent's
+    # MCP pipe, so it lands in back with nothing to configure — and since only
+    # one process can own the terminal, there is only ever one front.
+    front = sys.stdin.isatty()
 
-    config = args.config or str(default_config_path())
+    # A subagent with no --config starts empty; the front defaults to servers.json.
+    config = args.config or (str(default_config_path()) if front else None)
     try:
-        client_cfg = load_config(config)
+        client_cfg = load_config(config) if config else ClientConfig()
     except (FileNotFoundError, ValueError) as e:
         print(c(f"Config error: {e}", "red"), file=sys.stderr)
         return 2
     servers = client_cfg.servers
 
-    print(c(f"Connecting to {len(servers)} MCP server(s) from {config} …", "dim"))
+    if front:
+        print(c(f"Connecting to {len(servers)} MCP server(s) from {config} …", "dim"))
     async with MCPManager(servers, permissions=client_cfg.permissions) as manager:
-        if not manager.sessions:
+        if front and not manager.sessions:
             if servers:
                 print(c("No servers connected. Check /servers output and your config.", "red"))
             else:
                 print(c("No MCP servers configured — chat and /spawn still work.", "dim"))
-        repl = Repl(manager, backend=args.backend, model=args.model,
+        repl = Repl(manager, front=front, backend=args.backend, model=args.model,
                     host=chat_host, api_key=chat_api_key,
                     think=think, keep_alive=args.ollama_keep_alive,
                     system_prompt=client_cfg.system_prompt,
                     spawn_settings=spawn_settings)
-        await repl.run()
-    print(c("bye.", "dim"))
+        if front:
+            await repl.run()
+        else:
+            # Back: no stdout chatter — the MCP protocol owns stdout.
+            from .server import serve  # noqa: PLC0415 — pulls in FastMCP only when serving
+            await serve(repl, client_cfg)
+    if front:
+        print(c("bye.", "dim"))
     return 0
 
 
 def _serve_arg_tail(args) -> list[str]:
-    """Argv (after the interpreter) used to launch a subagent in server mode.
+    """Argv (after the interpreter) used to launch a subagent.
 
     Forwards the parent's backend selection so subagents use the same LLM, but
     deliberately omits ``--config`` — subagents start empty and are wired up
     dynamically. API keys are inherited from the environment, not passed here.
     """
-    tail = ["-m", "mcp_client_seb", "--serve", "--backend", args.backend]
+    tail = ["-m", "mcp_client_seb", "--backend", args.backend]
     if args.model:
         tail += ["--model", args.model]
     if args.ollama_host:

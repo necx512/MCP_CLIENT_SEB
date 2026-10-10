@@ -91,6 +91,31 @@ def ollama_models(host: str, api_key: str | None = None) -> list[str]:
         return []
 
 
+def _parse_keep_alive(value: str | None) -> str | int | None:
+    """``keep_alive`` as Ollama expects it: a bare number is seconds, sent as a number.
+
+    Ollama parses a JSON *string* as a Go duration, so ``"-1"`` or ``"0"`` (no
+    unit) is rejected with HTTP 400 — they must go out as the numbers -1 / 0.
+    Strings with a unit (``"30m"``, ``"1h"``) are passed through unchanged.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    try:
+        return int(value)
+    except ValueError:
+        return value or None
+
+
+def _http_error_detail(e: urllib.error.HTTPError) -> str:
+    """Best-effort extraction of Ollama's JSON ``{"error": ...}`` body."""
+    try:
+        body = json.loads(e.read().decode())
+    except (ValueError, OSError):
+        return e.reason or "unknown error"
+    return str(body.get("error") or body) if isinstance(body, dict) else str(body)
+
+
 def _tool_text(parts: list[dict[str, Any]], pending_images: list[str]) -> str:
     """Normalized parts -> text for an Ollama tool message; images are queued."""
     out: list[str] = []
@@ -107,7 +132,7 @@ class OllamaAgent(BaseAgent):
     name = "ollama"
 
     def __init__(self, manager: MCPManager, host: str, model: str, api_key: str | None = None,
-                 think: bool | None = None, keep_alive: str | None = None):
+                 think: bool | None = None, keep_alive: str | int | None = None):
         self._host = host
         self.model = model
         self._api_key = api_key
@@ -139,7 +164,7 @@ class OllamaAgent(BaseAgent):
             if env_think is not None:
                 think = env_think.strip().lower() in ("1", "true", "on", "yes")
         # Only sent when explicitly set (flag or env); otherwise Ollama uses its own default.
-        keep_alive = settings.keep_alive or os.environ.get("OLLAMA_KEEP_ALIVE")
+        keep_alive = _parse_keep_alive(settings.keep_alive or os.environ.get("OLLAMA_KEEP_ALIVE"))
         return cls(manager, host=host, model=model, api_key=api_key,
                    think=think, keep_alive=keep_alive)
 
@@ -171,7 +196,7 @@ class OllamaAgent(BaseAgent):
             "messages": self._messages,
             "stream": False,
         }
-        if self._keep_alive:
+        if self._keep_alive is not None:
             payload["keep_alive"] = self._keep_alive
         if self._think is not None:
             payload["think"] = self._think  # False = skip the model's <think> phase (much faster)
@@ -180,6 +205,9 @@ class OllamaAgent(BaseAgent):
             payload["tools"] = tools
         try:
             resp = _post_json(f"{self._host}/api/chat", payload, CHAT_TIMEOUT, self._api_key)
+        except urllib.error.HTTPError as e:
+            detail = _http_error_detail(e)
+            raise BackendError(f"Ollama request failed (HTTP {e.code}): {detail}") from e
         except urllib.error.URLError as e:
             raise BackendError(f"Ollama request failed: {e}") from e
         except (OSError, ValueError) as e:

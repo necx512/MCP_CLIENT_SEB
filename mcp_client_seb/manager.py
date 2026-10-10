@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
 from .config import PermissionConfig, ServerConfig
@@ -32,9 +32,15 @@ logger = logging.getLogger("mcp_client_seb.manager")
 LocalHandler = Callable[[dict[str, Any]], Awaitable[tuple[list[dict[str, Any]], bool]]]
 
 #: Asks a human to approve a tool call: ``(ToolRef, arguments) -> allowed?``.
-#: Injected by the REPL (interactive prompt). ``None`` means no approver is
-#: attached (e.g. subagent server mode) — permission-required tools are denied.
+#: Injected by the REPL: a keyboard prompt in front, an escalation to the parent
+#: in back. ``None`` means no approver is attached — such tools are denied.
 PermissionPrompt = Callable[["ToolRef", dict[str, Any]], Awaitable[bool]]
+
+#: Answers an elicitation a connected server sent mid-tool-call:
+#: ``(server_name, ElicitRequestParams) -> ElicitResult``. This is how a
+#: subagent's permission request reaches us. Injected by the REPL; ``None``
+#: declines every elicitation.
+ElicitHandler = Callable[[str, Any], Awaitable[types.ElicitResult]]
 
 
 @dataclass
@@ -71,9 +77,10 @@ class MCPManager:
         self.connect_errors: dict[str, str] = {}
         self._conn_tasks: dict[str, asyncio.Task] = {}
         self._shutdown: dict[str, asyncio.Event] = {}
-        #: Set by the REPL to an interactive approver; left ``None`` in headless
-        #: (subagent) mode, where permission-required tools are denied by default.
+        #: Set by the REPL (see :data:`PermissionPrompt`); ``None`` denies.
         self.permission_prompt: PermissionPrompt | None = None
+        #: Set by the REPL (see :data:`ElicitHandler`); ``None`` declines.
+        self.elicit_handler: ElicitHandler | None = None
         #: Tools the human chose to "always allow" this session (exposed names).
         self.always_allow: set[str] = set()
 
@@ -138,7 +145,9 @@ class MCPManager:
             command=cfg.command, args=cfg.args, env=cfg.merged_env(), cwd=cfg.cwd)
         try:
             async with stdio_client(params) as (read, write), \
-                    ClientSession(read, write) as session:
+                    ClientSession(read, write,
+                                  elicitation_callback=self._elicitation_callback(cfg.name)
+                                  ) as session:
                 await session.initialize()
                 self.sessions[cfg.name] = session
                 await self._register_tools(cfg.name, session, prefix=prefix)
@@ -152,6 +161,25 @@ class MCPManager:
                 logger.warning("Connection to %s dropped: %s", cfg.name, e)
         finally:
             self.sessions.pop(cfg.name, None)
+
+    def _elicitation_callback(self, server: str):
+        """Route a server's elicitation to :attr:`elicit_handler`, tagged with its name.
+
+        Looked up per call, not bound at connect time, so the REPL can install
+        its handler after the static servers are already connected. Any failure
+        declines — an elicitation is how permission requests travel, so a broken
+        handler must never read as consent.
+        """
+        async def callback(_context: Any, params: Any) -> types.ElicitResult:
+            handler = self.elicit_handler
+            if handler is None:
+                return types.ElicitResult(action="decline")
+            try:
+                return await handler(server, params)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("elicitation from %s failed: %s", server, e)
+                return types.ElicitResult(action="decline")
+        return callback
 
     async def _register_tools(self, server: str, session: ClientSession,
                               prefix: str | None = None) -> None:

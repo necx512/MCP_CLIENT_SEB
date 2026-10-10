@@ -5,12 +5,6 @@
       "command": "python3",
       "args": ["bash_server.py"],
       "cwd": "/home/debian/IA/MCP_CLIENT_SEB"
-    },
-    "agent_re": {
-      "command": "python3",
-      "args": ["-m", "mcp_client_seb", "--serve", "--backend", "anthropic", "--config", "scout.json"],
-      "cwd": "/home/debian/IA/MCP_CLIENT_SEB",
-      "prefix": "agentRE"
     }
   }
 }

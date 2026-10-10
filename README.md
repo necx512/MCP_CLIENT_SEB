@@ -470,7 +470,7 @@ MCP_CLIENT_SEB/
     ├── cli.py                      # REPL + backend selection + /spawn
     ├── manager.py                  # MCPManager (provider-neutral, dynamic connect)
     ├── config.py                   # config parsing
-    ├── server.py                   # --serve: expose this client AS an MCP server
+    ├── server.py                   # back mode: the REPL's MCP face (ask, …)
     ├── subagent.py                 # spawn_subagent tool + /spawn helper
     └── backends/
         ├── __init__.py             # BACKENDS registry + build_agent()
@@ -490,8 +490,11 @@ controls. An agent driving a subagent driving a sub-subagent, and so on.
 
 ### The idea
 
-* A subagent is just `python -m mcp_client_seb --serve`: instead of a REPL it
-  speaks MCP over stdio.
+* Every agent runs the same REPL; front or back is detected automatically. The
+  one process whose stdin is a terminal is **front** (keyboard prompts). A
+  subagent's stdin is its parent's pipe, so it is **back**: it speaks MCP over
+  stdio and its prompts arrive through its `ask` tool — chat or a `/command`,
+  exactly as if typed.
 * It is **never put in `servers.json`.** The parent launches it and connects to
   it **dynamically at runtime** — that is the whole point. (`servers.json` is
   for your fixed, always-on tool servers.)
@@ -686,14 +689,15 @@ mcp> /call run_bash {"command": "uname -a"}
   Linux ...
 ```
 
-### Headless / subagent mode
+### Subagents (back mode)
 
-A [subagent](#13-subagents-spawning-and-controlling-instances) (`--serve`) has no
-human attached, so it **cannot** prompt. A permission-gated tool called inside a
-subagent is **denied by default**, and the caller is told why. The subagent
-loads the same `requirePermission` rules its config declares, so it gates the
-same tools the parent would — it just can't approve them. Give a subagent only
-servers/tools it's allowed to run unattended.
+A [subagent](#13-subagents-spawning-and-controlling-instances) has no keyboard,
+so it **escalates**: a permission-gated call inside it is sent to its parent as
+an MCP elicitation, relayed up the chain, and asked at the front as
+`🔒 permission required — worker/scout/run_bash (bash)`. `a` (always) is
+remembered by the subagent that owns the tool. If there's nobody to ask — no
+`ask` running, or a parent that can't answer elicitations — the call is
+**denied**.
 
 ---
 

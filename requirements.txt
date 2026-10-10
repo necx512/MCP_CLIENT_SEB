@@ -1,5 +1,7 @@
 # Required — MCP client transport + protocol
-mcp>=1.0.0
+# Pinned <2: v2 renamed/restructured mcp.server.fastmcp.FastMCP (used by
+# mcp_client_seb/server.py and bash_server.py) to mcp.server.mcpserver.MCPServer.
+mcp>=1.0.0,<2
 
 # Optional — only needed for the Claude-driven chat mode.
 # Manual /call tool access works without it.

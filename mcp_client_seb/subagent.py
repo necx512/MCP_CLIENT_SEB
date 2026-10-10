@@ -1,7 +1,8 @@
 """Spawning and controlling subagents.
 
-A *subagent* is another instance of this very project launched in server mode
-(``python -m mcp_client_seb --serve``) and connected to over stdio like any
+A *subagent* is another instance of this very project (``python -m
+mcp_client_seb``), which serves MCP because its stdin is our pipe rather than a
+terminal (see :mod:`mcp_client_seb.cli`), and is connected to over stdio like any
 other MCP server — but it is never listed in ``servers.json``; it is wired up
 dynamically at runtime via :meth:`MCPManager.connect`.
 
@@ -84,13 +85,13 @@ class SpawnSettings:
     """How to launch a subagent process — the parent's backend choice forwarded on.
 
     ``serve_args`` is the argv tail after the interpreter, e.g.
-    ``["-m", "mcp_client_seb", "--serve", "--backend", "anthropic"]``. It carries
+    ``["-m", "mcp_client_seb", "--backend", "anthropic"]``. It carries
     no ``--config`` so every subagent starts with zero MCP servers and is
     configured dynamically through its exposed tools.
     """
 
     python: str = field(default_factory=lambda: sys.executable)
-    serve_args: list[str] = field(default_factory=lambda: ["-m", "mcp_client_seb", "--serve"])
+    serve_args: list[str] = field(default_factory=lambda: ["-m", "mcp_client_seb"])
 
     def config_for(self, name: str, config: str | None = None) -> ServerConfig:
         args = list(self.serve_args)
