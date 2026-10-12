@@ -44,7 +44,9 @@ from . import __version__
 from .backends import BackendUnavailable, BaseAgent, ChatSettings, build_agent
 from .config import ClientConfig, default_config_path, load_config
 from .manager import OUTPUT_LOGGER, MCPManager, ToolRef, parts_to_text
-from .subagent import SpawnSettings, install_spawn_tool, remove_subagent, spawn_subagent
+from .subagent import (
+    SpawnSettings, create_agent_config, install_spawn_tool, remove_subagent, spawn_subagent,
+)
 
 logger = logging.getLogger("mcp_client_seb.cli")
 
@@ -124,10 +126,14 @@ HELP = f"""
   {c('/schema', 'cyan')} <tool>       print a tool's JSON input schema
   {c('/call', 'cyan')} <tool> [json]  call a tool directly, e.g.
                           /call file_info {{"path": "/bin/ls"}}
-  {c('/spawn', 'cyan')} <name> [-c cfg.json] [prompt]
-                          launch a subagent (this project in server mode) and
-                          connect it; -c gives it a config of MCP servers to
-                          start with. Drive it via its <name>__ask tool.
+  {c('/mkconfig', 'cyan')} <path> [json]
+                          write a subagent config file; json takes the same
+                          keys as the create_agent_config tool, e.g.
+                          /mkconfig w.json {{"system_prompt": "...", "mcp_servers": {{}}}}
+  {c('/spawn', 'cyan')} <name> <cfg.json>
+                          launch a subagent (this project in server mode) from
+                          its config file and connect it. Drive it via its
+                          <name>__ask tool.
   {c('/kill', 'cyan')} <name>         stop a spawned subagent and drop its tools
   {c('/ask', 'cyan')} <path> <prompt>  send one prompt to a subagent, e.g.
                           /ask worker/scout /tools — its output streams live
@@ -180,7 +186,8 @@ class Repl:
         self._keep_alive = keep_alive
         self._system_prompt = system_prompt
         self._spawn_settings = spawn_settings or SpawnSettings()
-        # Offer spawn_subagent to the LLM as a local tool (mirrors /spawn).
+        # Offer create_agent_config / spawn_subagent / remove_subagent to the
+        # LLM as local tools (mirror /mkconfig, /spawn, /kill).
         install_spawn_tool(self.manager, self._spawn_settings)
         # Who approves permission-gated calls — ours and our subagents'.
         if front:
@@ -291,24 +298,38 @@ class Repl:
         self.out(c(f"  [{'error' if is_error else 'ok'}]", style))
         self.out(parts_to_text(content))
 
+    async def cmd_mkconfig(self, arg: str) -> None:
+        path, _, args_json = arg.strip().partition(" ")
+        if not path:
+            self.out(c("  Usage: /mkconfig <path> [json]", "yellow"))
+            return
+        try:
+            fields = json.loads(args_json) if args_json.strip() else {}
+        except json.JSONDecodeError as e:
+            self.out(c(f"  Invalid JSON arguments: {e}", "red"))
+            return
+        if not isinstance(fields, dict):
+            self.out(c("  JSON arguments must be an object", "red"))
+            return
+        content, is_error = create_agent_config(
+            path,
+            system_prompt=fields.get("system_prompt"),
+            description=fields.get("description"),
+            mcp_servers=fields.get("mcp_servers"),
+            require_permission=fields.get("require_permission"),
+            overwrite=bool(fields.get("overwrite", False)),
+        )
+        self.out(c(parts_to_text(content), "red" if is_error else "green"))
+
     async def cmd_spawn(self, arg: str) -> None:
         tokens = arg.strip().split()
-        if not tokens:
-            self.out(c("  Usage: /spawn <name> [-c <config.json>] [system prompt]", "yellow"))
+        if len(tokens) != 2:
+            self.out(c("  Usage: /spawn <name> <config.json>", "yellow"))
             return
-        name = tokens[0]
-        rest = tokens[1:]
-        config = None
-        if rest and rest[0] in ("-c", "--config"):
-            if len(rest) < 2:
-                self.out(c("  Usage: /spawn <name> [-c <config.json>] [system prompt]", "yellow"))
-                return
-            config = rest[1]
-            rest = rest[2:]
-        system_prompt = " ".join(rest) if rest else None
+        name, config = tokens
         self.out(c(f"  → spawning subagent {name!r} …", "dim"))
         content, is_error = await spawn_subagent(
-            self.manager, name, self._spawn_settings, system_prompt, config)
+            self.manager, name, self._spawn_settings, config)
         self.out(c(parts_to_text(content), "red" if is_error else "green"))
 
     async def cmd_kill(self, arg: str) -> None:
@@ -596,6 +617,8 @@ class Repl:
             self.cmd_schema(arg)
         elif cmd == "call":
             await self.cmd_call(arg)
+        elif cmd == "mkconfig":
+            await self.cmd_mkconfig(arg)
         elif cmd == "spawn":
             await self.cmd_spawn(arg)
         elif cmd == "kill":
@@ -740,9 +763,9 @@ async def _amain(argv: list[str] | None = None) -> int:
 def _serve_arg_tail(args) -> list[str]:
     """Argv (after the interpreter) used to launch a subagent.
 
-    Forwards the parent's backend selection so subagents use the same LLM, but
-    deliberately omits ``--config`` — subagents start empty and are wired up
-    dynamically. API keys are inherited from the environment, not passed here.
+    Forwards the parent's backend selection so subagents use the same LLM.
+    ``--config`` is added per subagent by :meth:`SpawnSettings.config_for`.
+    API keys are inherited from the environment, not passed here.
     """
     tail = ["-m", "mcp_client_seb", "--backend", args.backend]
     if args.model:

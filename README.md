@@ -218,7 +218,8 @@ with a message (and manual `/call` still works).
 | `/tools [filter]` | List tools. Optional `filter` matches name or description. |
 | `/schema <tool>` | Print a tool's JSON input schema (so you know what args to pass). |
 | `/call <tool> [json]` | Call a tool directly. `json` is its arguments; omit for none. |
-| `/spawn <name> [prompt]` | Launch a **subagent** (this project in server mode) and connect it dynamically. Drive it via its `<name>__ask` tool. See [§13](#13-subagents-spawning-and-controlling-instances). |
+| `/mkconfig <path> [json]` | Write a **subagent config file** (system prompt, description, MCP servers). `json` takes the same keys as the `create_agent_config` tool. See [§13](#13-subagents-spawning-and-controlling-instances). |
+| `/spawn <name> <config.json>` | Launch a **subagent** (this project in server mode) from its config file and connect it dynamically. Drive it via its `<name>__ask` tool. |
 | `/kill <name>` | Stop a spawned subagent: terminate its process and drop its `<name>__` tools. |
 | `/thinking` | Toggle showing Claude's reasoning summary in chat mode. |
 | `/reset` | Clear the chat conversation and start fresh. |
@@ -467,11 +468,11 @@ MCP_CLIENT_SEB/
 ├── README.md                       # this file
 └── mcp_client_seb/
     ├── __main__.py                 # python -m mcp_client_seb
-    ├── cli.py                      # REPL + backend selection + /spawn
+    ├── cli.py                      # REPL + backend selection + /mkconfig, /spawn
     ├── manager.py                  # MCPManager (provider-neutral, dynamic connect)
     ├── config.py                   # config parsing
     ├── server.py                   # back mode: the REPL's MCP face (ask, …)
-    ├── subagent.py                 # spawn_subagent tool + /spawn helper
+    ├── subagent.py                 # create_agent_config + spawn_subagent (REPL & LLM)
     └── backends/
         ├── __init__.py             # BACKENDS registry + build_agent()
         ├── base.py                 # BaseAgent: shared tool-use loop
@@ -519,10 +520,10 @@ Once connected as `worker`, these appear in the parent's tool namespace:
 | `worker__list_tools()` | List the tools the subagent currently has. |
 | `worker__reset()` | Start the subagent on a fresh conversation. |
 
-A subagent's **system prompt is fixed at spawn time**, delivered through its
-config file's `systemPrompt` key (created on the fly when you pass a prompt to
-`/spawn` or `spawn_subagent`). There is no runtime re-steering tool — to change
-it, respawn the subagent or edit its config.
+A subagent is defined **only by its config file** — `systemPrompt`,
+`description`, `mcpServers`, `requirePermission`. Spawning takes a name and a
+config path, nothing else; to change a subagent, edit (or regenerate) its config
+and respawn it.
 
 **Telling the parent what a subagent is for.** The parent's LLM only sees the
 subagent's `ask` tool — so it can only route work to the right subagent if that
@@ -539,35 +540,47 @@ the parent receives:
 ```
 
 Without a `description`, the subagent falls back to a trimmed `systemPrompt`
-(so `/spawn worker <prompt>` already gives the parent *something* to route on),
+(so a config with only a prompt already gives the parent *something* to route on),
 and with neither it uses a generic "delegate a task" description. The
 `systemPrompt` still steers the subagent's own reasoning; `description` is purely
 the outward-facing blurb the parent sees.
 
-### Two ways to spawn
+### Creating a config, then spawning
+
+Two shared functions in `subagent.py` back both the REPL and the parent's LLM,
+so both paths behave identically:
+
+| Function | REPL command | LLM tool |
+|---|---|---|
+| `create_agent_config(path, system_prompt, description, mcp_servers, require_permission, overwrite)` | `/mkconfig <path> [json]` | `create_agent_config` |
+| `spawn_subagent(manager, name, settings, config)` | `/spawn <name> <config.json>` | `spawn_subagent` |
+
+`create_agent_config` refuses to replace an existing file unless `overwrite` is
+true, and validates what it wrote (a bad server entry is reported at once).
 
 **From the REPL** (human-driven):
 
 ```
-mcp> /spawn worker You are a focused web-research subagent.
+mcp> /mkconfig agents/worker.json {"system_prompt": "You are a focused web-research subagent.", "description": "Web research", "mcp_servers": {}}
+Wrote subagent config /…/agents/worker.json (MCP servers: none). Launch it with spawn_subagent.
+mcp> /spawn worker agents/worker.json
   → spawning subagent 'worker' …
-Spawned subagent 'worker'. New tools:
+Spawned subagent 'worker' from agents/worker.json. New tools:
   - worker__ask
   - worker__connect_server
   - worker__list_tools
   - worker__reset
-  system prompt: baked into the subagent's config
 Delegate work with worker__ask.
 
-mcp> /call worker__connect_server {"name": "web", "command": "python3", "args": ["-m", "some_web_server"]}
 mcp> /call worker__ask {"prompt": "Summarize example.com"}
 ```
 
-**From chat** (LLM-driven): the parent's model is given built-in
-`spawn_subagent` and `remove_subagent` tools, so it can create, orchestrate, and
-tear down subagents itself — spawn a worker, give it servers via
-`worker__connect_server`, delegate with `worker__ask`, then `remove_subagent` it
-when done — all within one conversation.
+An existing hand-written config works the same: `/spawn scout scout.json`.
+
+**From chat** (LLM-driven): the parent's model is given the built-in
+`create_agent_config`, `spawn_subagent` and `remove_subagent` tools, so it can
+write a config, spawn a worker from it, delegate with `worker__ask`, then
+`remove_subagent` it when done — all within one conversation.
 
 **Removing a subagent** — `/kill <name>` (or the `remove_subagent` tool) stops
 the subagent's process and drops its `<name>__` tools; the name is then free to
@@ -581,7 +594,7 @@ servers.
   command line.
 * From Python you can drive this directly:
   `await manager.connect(cfg, prefix="worker")` connects any MCP server at
-  runtime; `spawn_subagent(manager, "worker", SpawnSettings())` wraps the launch.
+  runtime; `spawn_subagent(manager, "worker", SpawnSettings(), "worker.json")` wraps the launch.
 * Subagent processes are children of the parent and are shut down cleanly when
   the parent exits.
 

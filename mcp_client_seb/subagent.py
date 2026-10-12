@@ -6,39 +6,80 @@ terminal (see :mod:`mcp_client_seb.cli`), and is connected to over stdio like an
 other MCP server — but it is never listed in ``servers.json``; it is wired up
 dynamically at runtime via :meth:`MCPManager.connect`.
 
+A subagent is defined **only by its config file** (``systemPrompt``,
+``description``, ``mcpServers``, ``requirePermission``): spawning takes a name
+and a config path, nothing else. Two functions are shared by the ``/mkconfig``
+and ``/spawn`` REPL commands and by the LLM's local tools of the same purpose:
+
+* :func:`create_agent_config` — write a subagent config file;
+* :func:`spawn_subagent` — launch a subagent from a config file.
+
 The subagent exposes a handful of tools (``ask``, ``connect_server``,
 ``list_tools``, ``reset``) namespaced under its handle, e.g. ``worker__ask``.
-Spawning it registers a local ``spawn_subagent`` tool so the parent's LLM can
-create and drive subagents on its own; the same helper backs the ``/spawn`` REPL
-command. A subagent's system prompt is fixed at launch via its config file's
-``systemPrompt`` (created on the fly when a prompt is given) — there is no
-runtime ``set_system_prompt``.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .config import ServerConfig
+from .config import ServerConfig, load_config
 from .manager import MCPManager
 
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
+CONFIG_TOOL_NAME = "create_agent_config"
+CONFIG_TOOL_DESCRIPTION = (
+    "Write a subagent config file (JSON) that spawn_subagent can then launch. "
+    "It holds the subagent's system prompt, a one-line description of what it "
+    "is for (shown to the parent so it can route work to it), and the MCP "
+    "servers it connects to at startup. Refuses to replace an existing file "
+    "unless overwrite is true."
+)
+CONFIG_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": "Where to write the config file (e.g. agents/worker.json).",
+        },
+        "system_prompt": {
+            "type": "string",
+            "description": "System prompt steering the subagent's own LLM.",
+        },
+        "description": {
+            "type": "string",
+            "description": "One-line summary of what the subagent specialises in.",
+        },
+        "mcp_servers": {
+            "type": "object",
+            "description": "MCP servers the subagent connects to at startup, in "
+                           "the mcpServers shape: {\"<name>\": {\"command\": \"...\", "
+                           "\"args\": [...], \"env\": {...}, \"cwd\": \"...\"}}.",
+        },
+        "require_permission": {
+            "description": "Tools needing human approval: true (all) or a list of tool names.",
+            "anyOf": [{"type": "boolean"}, {"type": "array", "items": {"type": "string"}}],
+        },
+        "overwrite": {
+            "type": "boolean",
+            "description": "Replace the file if it already exists (default false).",
+        },
+    },
+    "required": ["path"],
+}
+
 SPAWN_TOOL_NAME = "spawn_subagent"
 SPAWN_TOOL_DESCRIPTION = (
-    "Spawn a subagent: a fresh, separately-configurable instance of this MCP "
-    "client with its own LLM and its own (initially empty) set of MCP servers. "
-    "Returns the new tools it exposes, namespaced under <name>__: use "
-    "<name>__ask to delegate a task to it and <name>__connect_server to give it "
-    "access to an MCP server. Its system prompt (optional 'system_prompt' arg) is "
-    "fixed at spawn time and cannot be changed afterwards."
+    "Spawn a subagent from a config file (write one first with "
+    "create_agent_config): a fresh instance of this MCP client with its own LLM, "
+    "system prompt and MCP servers, all taken from that file. Returns the new "
+    "tools it exposes, namespaced under <name>__: use <name>__ask to delegate a "
+    "task to it."
 )
 SPAWN_TOOL_SCHEMA = {
     "type": "object",
@@ -48,18 +89,12 @@ SPAWN_TOOL_SCHEMA = {
             "description": "Unique handle for the subagent (letters, digits, _ , -). "
                            "Its tools are exposed as <name>__ask, <name>__connect_server, …",
         },
-        "system_prompt": {
-            "type": "string",
-            "description": "Optional initial system prompt steering the subagent's own LLM.",
-        },
         "config": {
             "type": "string",
-            "description": "Optional path to a JSON config file with an 'mcpServers' object; "
-                           "the subagent connects to those servers at startup (it starts with "
-                           "no servers if omitted).",
+            "description": "Path to the subagent's JSON config file.",
         },
     },
-    "required": ["name"],
+    "required": ["name", "config"],
 }
 
 REMOVE_TOOL_NAME = "remove_subagent"
@@ -85,18 +120,15 @@ class SpawnSettings:
     """How to launch a subagent process — the parent's backend choice forwarded on.
 
     ``serve_args`` is the argv tail after the interpreter, e.g.
-    ``["-m", "mcp_client_seb", "--backend", "anthropic"]``. It carries
-    no ``--config`` so every subagent starts with zero MCP servers and is
-    configured dynamically through its exposed tools.
+    ``["-m", "mcp_client_seb", "--backend", "anthropic"]``; the subagent's
+    ``--config`` is appended by :meth:`config_for`.
     """
 
     python: str = field(default_factory=lambda: sys.executable)
     serve_args: list[str] = field(default_factory=lambda: ["-m", "mcp_client_seb"])
 
-    def config_for(self, name: str, config: str | None = None) -> ServerConfig:
-        args = list(self.serve_args)
-        if config:
-            args += ["--config", config]
+    def config_for(self, name: str, config: str) -> ServerConfig:
+        args = list(self.serve_args) + ["--config", config]
         # Name this child for an attached interceptor (an optional external tool
         # — see llm_interceptor), so it can tell "root/worker/scout" from
         # "root/worker". The parent's own path travels in the env, so this
@@ -113,112 +145,93 @@ class SpawnSettings:
         return ServerConfig(name=name, command=self.python, args=args, env=env)
 
 
+def create_agent_config(
+    path: str,
+    system_prompt: str | None = None,
+    description: str | None = None,
+    mcp_servers: dict[str, Any] | None = None,
+    require_permission: bool | list[str] | None = None,
+    overwrite: bool = False,
+) -> tuple[list[dict[str, str]], bool]:
+    """Write a subagent config file. Returns ``(content_parts, is_error)``.
+
+    The written file is re-read with :func:`load_config` so a malformed server
+    entry is reported now rather than at spawn time (the file is then removed).
+    Backs both ``/mkconfig`` and the ``create_agent_config`` local tool.
+    """
+    if not (path or "").strip():
+        return _err("missing config path")
+    target = Path(path).expanduser()
+    if target.exists() and not overwrite:
+        return _err(f"config file already exists: {target} (pass overwrite to replace it)")
+    if mcp_servers is not None and not isinstance(mcp_servers, dict):
+        return _err("'mcp_servers' must be an object {name: {command, args, …}}")
+
+    data: dict[str, Any] = {}
+    if description:
+        data["description"] = description
+    if system_prompt:
+        data["systemPrompt"] = system_prompt
+    if require_permission is not None:
+        data["requirePermission"] = require_permission
+    data["mcpServers"] = mcp_servers or {}
+
+    existed = target.exists()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        load_config(target)
+    except ValueError as e:
+        if not existed:
+            target.unlink(missing_ok=True)
+        return _err(f"invalid subagent config: {e}")
+    except OSError as e:
+        return _err(f"could not write config: {type(e).__name__}: {e}")
+
+    servers = ", ".join(data["mcpServers"]) or "none"
+    return [{"type": "text",
+             "text": f"Wrote subagent config {target.resolve()} (MCP servers: {servers}). "
+                     f"Launch it with spawn_subagent."}], False
+
+
 async def spawn_subagent(
     manager: MCPManager,
     name: str,
     settings: SpawnSettings,
-    system_prompt: str | None = None,
-    config: str | None = None,
+    config: str,
 ) -> tuple[list[dict[str, str]], bool]:
-    """Launch a subagent and connect it. Returns ``(content_parts, is_error)``.
+    """Launch a subagent from its config file and connect it.
 
-    ``config`` is an optional path to a JSON config file (``mcpServers`` shape)
-    the subagent connects to at startup; without it the subagent starts empty.
-
-    ``system_prompt`` is delivered to the subagent **through its config file's**
-    ``systemPrompt`` key — read once at startup — not via a ``set_system_prompt``
-    call. If a prompt is supplied but the target config doesn't exist, it's
-    created dynamically just before the spawn (a throwaway temp file when no path
-    was given). See :func:`_prepare_config`.
-
-    The return shape matches :meth:`MCPManager.call_tool` so this can back both
-    the ``spawn_subagent`` local tool and the ``/spawn`` command directly.
+    Returns ``(content_parts, is_error)``, the shape of
+    :meth:`MCPManager.call_tool`, so this backs both ``/spawn`` and the
+    ``spawn_subagent`` local tool directly. The config is validated here first
+    so a bad file gives a clear error instead of a dead child process.
     """
     name = (name or "").strip()
     if not _NAME_RE.match(name):
         return _err(f"invalid subagent name {name!r} "
                     "(use letters/digits/_/-, starting with a letter)")
-
+    if not (config or "").strip():
+        return _err("missing config path (write one with create_agent_config)")
+    config_path = Path(config).expanduser()
     try:
-        config_path, temp_cfg = _prepare_config(name, config, system_prompt)
-    except FileNotFoundError as e:
-        return _err(str(e))
-    except (OSError, ValueError) as e:  # noqa: BLE001 — bad/unwritable config
-        return _err(f"could not prepare subagent config: {type(e).__name__}: {e}")
+        load_config(config_path)
+    except (FileNotFoundError, ValueError) as e:
+        return _err(f"bad subagent config: {e}")
 
-    cfg = settings.config_for(name, config=config_path)
+    cfg = settings.config_for(name, config=str(config_path.resolve()))
     try:
-        try:
-            new_tools = await manager.connect(cfg, prefix=name)
-        except Exception as e:  # noqa: BLE001 — report, don't crash the caller
-            return _err(f"failed to spawn subagent {name!r}: {type(e).__name__}: {e}")
-    finally:
-        # The subagent reads its config at startup, so it's already been loaded
-        # by the time connect() returns (or the child died) — safe to remove.
-        if temp_cfg:
-            try:
-                os.unlink(temp_cfg)
-            except OSError:
-                pass
+        new_tools = await manager.connect(cfg, prefix=name)
+    except Exception as e:  # noqa: BLE001 — report, don't crash the caller
+        return _err(f"failed to spawn subagent {name!r}: {type(e).__name__}: {e}")
 
-    lines = [f"Spawned subagent {name!r}. New tools:"]
+    lines = [f"Spawned subagent {name!r} from {config_path}. New tools:"]
     for tool_name in sorted(new_tools):
         ref = manager.tools.get(tool_name)
         desc = ref.description.strip().splitlines()[0] if ref and ref.description.strip() else ""
         lines.append(f"  - {tool_name}: {desc}" if desc else f"  - {tool_name}")
-
-    if system_prompt:
-        lines.append("  system prompt: baked into the subagent's config")
-
     lines.append(f"Delegate work with {name}__ask.")
     return [{"type": "text", "text": "\n".join(lines)}], False
-
-
-def _prepare_config(
-    name: str, config: str | None, system_prompt: str | None,
-) -> tuple[str | None, str | None]:
-    """Resolve the ``--config`` path for a subagent, creating it if needed.
-
-    Returns ``(config_path, temp_to_cleanup)``. The system prompt is carried by
-    the config file's ``systemPrompt`` key (read at startup), never a runtime
-    ``set_system_prompt`` call. Behaviour:
-
-    * no config path, no prompt → ``(None, None)`` (subagent starts empty).
-    * config path exists → used as-is; if a prompt is also given it's merged over
-      the file's servers into a **throwaway** copy (the user's file is untouched).
-    * config path missing + prompt → the file is created at that path.
-    * no config path + prompt → a throwaway temp file is created.
-
-    ``temp_to_cleanup`` is a path the caller must delete after the spawn (or
-    ``None`` for a persistent, caller-chosen path).
-    """
-    if not config and not system_prompt:
-        return None, None
-
-    data: dict[str, Any] = {"mcpServers": {}}
-    existing = Path(config).expanduser() if config else None
-    if existing and existing.is_file():
-        data = json.loads(existing.read_text())  # start from the given config
-    elif config and not system_prompt:
-        # A path was named but doesn't exist and there's nothing to synthesize.
-        raise FileNotFoundError(f"config file not found: {existing}")
-
-    if system_prompt:
-        data["systemPrompt"] = system_prompt  # spawn-time prompt wins over the file's
-
-    if existing and not existing.is_file():
-        # Named path missing → create it there (persistent; caller's choice).
-        existing.parent.mkdir(parents=True, exist_ok=True)
-        existing.write_text(json.dumps(data, indent=2))
-        return str(existing.resolve()), None
-    if existing and not system_prompt:
-        return str(existing.resolve()), None  # existing file, nothing to inject
-
-    # Need a throwaway file: no path given, or existing file + prompt override.
-    fd, tmp = tempfile.mkstemp(prefix=f"subagent-{name}-", suffix=".json")
-    os.close(fd)
-    Path(tmp).write_text(json.dumps(data, indent=2))
-    return tmp, tmp
 
 
 async def remove_subagent(
@@ -245,20 +258,34 @@ async def remove_subagent(
 
 
 def install_spawn_tool(manager: MCPManager, settings: SpawnSettings) -> None:
-    """Register the local ``spawn_subagent`` and ``remove_subagent`` tools."""
+    """Register the ``create_agent_config``, ``spawn_subagent`` and
+    ``remove_subagent`` local tools (the LLM's side of ``/mkconfig``,
+    ``/spawn`` and ``/kill``)."""
+
+    async def config_handler(args: dict) -> tuple[list[dict[str, str]], bool]:
+        return create_agent_config(
+            path=str(args.get("path", "")),
+            system_prompt=args.get("system_prompt"),
+            description=args.get("description"),
+            mcp_servers=args.get("mcp_servers"),
+            require_permission=args.get("require_permission"),
+            overwrite=bool(args.get("overwrite", False)),
+        )
 
     async def spawn_handler(args: dict) -> tuple[list[dict[str, str]], bool]:
         return await spawn_subagent(
             manager,
             name=str(args.get("name", "")),
             settings=settings,
-            system_prompt=args.get("system_prompt"),
-            config=args.get("config"),
+            config=str(args.get("config", "")),
         )
 
     async def remove_handler(args: dict) -> tuple[list[dict[str, str]], bool]:
         return await remove_subagent(manager, name=str(args.get("name", "")))
 
+    manager.register_local_tool(
+        CONFIG_TOOL_NAME, CONFIG_TOOL_DESCRIPTION, CONFIG_TOOL_SCHEMA, config_handler
+    )
     manager.register_local_tool(
         SPAWN_TOOL_NAME, SPAWN_TOOL_DESCRIPTION, SPAWN_TOOL_SCHEMA, spawn_handler
     )
