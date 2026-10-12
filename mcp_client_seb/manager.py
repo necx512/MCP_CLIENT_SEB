@@ -42,6 +42,16 @@ PermissionPrompt = Callable[["ToolRef", dict[str, Any]], Awaitable[bool]]
 #: declines every elicitation.
 ElicitHandler = Callable[[str, Any], Awaitable[types.ElicitResult]]
 
+#: The MCP logger name a subagent streams its REPL output under, live, while an
+#: ``ask`` runs. Notifications under any other logger (a third-party server's
+#: own logs) are ignored, so only our agents' output reaches the screen.
+OUTPUT_LOGGER = "mcp_client_seb.out"
+
+#: Receives one streamed output line from a connected subagent:
+#: ``(server_name, data)`` where ``data`` is ``{"from": [...], "text": str}``.
+#: Injected by the REPL; ``None`` drops the stream.
+OutputHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
+
 
 @dataclass
 class ToolRef:
@@ -81,6 +91,8 @@ class MCPManager:
         self.permission_prompt: PermissionPrompt | None = None
         #: Set by the REPL (see :data:`ElicitHandler`); ``None`` declines.
         self.elicit_handler: ElicitHandler | None = None
+        #: Set by the REPL (see :data:`OutputHandler`); ``None`` drops.
+        self.output_handler: OutputHandler | None = None
         #: Tools the human chose to "always allow" this session (exposed names).
         self.always_allow: set[str] = set()
 
@@ -146,7 +158,8 @@ class MCPManager:
         try:
             async with stdio_client(params) as (read, write), \
                     ClientSession(read, write,
-                                  elicitation_callback=self._elicitation_callback(cfg.name)
+                                  elicitation_callback=self._elicitation_callback(cfg.name),
+                                  logging_callback=self._logging_callback(cfg.name),
                                   ) as session:
                 await session.initialize()
                 self.sessions[cfg.name] = session
@@ -179,6 +192,24 @@ class MCPManager:
             except Exception as e:  # noqa: BLE001
                 logger.warning("elicitation from %s failed: %s", server, e)
                 return types.ElicitResult(action="decline")
+        return callback
+
+    def _logging_callback(self, server: str):
+        """Route a subagent's streamed output to :attr:`output_handler`.
+
+        Display only: a failure here is logged and dropped, never raised into
+        the session's receive loop.
+        """
+        async def callback(params: types.LoggingMessageNotificationParams) -> None:
+            handler = self.output_handler
+            data = params.data
+            if (handler is None or params.logger != OUTPUT_LOGGER
+                    or not isinstance(data, dict) or "text" not in data):
+                return
+            try:
+                await handler(server, data)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("output from %s dropped: %s", server, e)
         return callback
 
     async def _register_tools(self, server: str, session: ClientSession,

@@ -495,6 +495,13 @@ controls. An agent driving a subagent driving a sub-subagent, and so on.
   subagent's stdin is its parent's pipe, so it is **back**: it speaks MCP over
   stdio and its prompts arrive through its `ask` tool — chat or a `/command`,
   exactly as if typed.
+* While an `ask` runs, a subagent streams everything it would have printed up
+  to its parent (MCP log notifications), so the front shows it live as
+  `worker/scout │ …`.
+* `/ask worker/scout <prompt>` sends one prompt down the chain; `/focus
+  worker/scout` redirects every line you type there until `/unfocus` — you talk
+  to that subagent as if it were front. The focus lives only in the front: an
+  LLM delegating to `worker__ask` meanwhile still reaches `worker`.
 * It is **never put in `servers.json`.** The parent launches it and connects to
   it **dynamically at runtime** — that is the whole point. (`servers.json` is
   for your fixed, always-on tool servers.)
@@ -707,4 +714,4 @@ remembered by the subagent that owns the tool. If there's nobody to ask — no
 - `ollama pull llama3.1`
 
 # TESTING PROMPT
-Can you create a subagent. Its config file is at /home/debian/IA/MCP_CLIENT_SEB/web.json
+1. Can you create a subagent. Its config file is at /home/debian/IA/MCP_CLIENT_SEB/web.json

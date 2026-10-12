@@ -9,7 +9,14 @@ over stdio and its prompts arrive through the ``ask`` tool (see
 
 What differs is who decides. A permission-gated tool call is approved at the
 keyboard in front; in back it's escalated to the parent as an MCP elicitation,
-which relays it up until it reaches the front.
+which relays it up until it reaches the front. Output works the same way:
+while an ``ask`` runs, back streams every line it would have printed up to its
+parent, and the front prints them live under the subagent's path.
+
+The front can redirect its keyboard: ``/focus worker/scout`` makes every line
+typed go to that subagent (via ``/ask``), so you talk to it as if it were front.
+The focus lives only in the front — the subagents themselves don't change, so
+an LLM delegating to ``worker__ask`` meanwhile still reaches ``worker``.
 
 Two kinds of input, always available in the same session:
 
@@ -36,7 +43,7 @@ from mcp import types
 from . import __version__
 from .backends import BackendUnavailable, BaseAgent, ChatSettings, build_agent
 from .config import ClientConfig, default_config_path, load_config
-from .manager import MCPManager, ToolRef, parts_to_text
+from .manager import OUTPUT_LOGGER, MCPManager, ToolRef, parts_to_text
 from .subagent import SpawnSettings, install_spawn_tool, remove_subagent, spawn_subagent
 
 logger = logging.getLogger("mcp_client_seb.cli")
@@ -99,6 +106,15 @@ def _permission_message(ref: ToolRef, arguments: dict) -> str:
     return f"{ref.exposed_name} ({ref.server or 'local'})\nargs: {preview}"
 
 
+#: Commands the front always runs itself, even while focused on a subagent —
+#: otherwise there would be no way back.
+_LOCAL_COMMANDS = ("focus", "unfocus", "quit", "exit", "q")
+
+
+def _is_local(line: str) -> bool:
+    return line.startswith("/") and line[1:].split(" ", 1)[0].lower() in _LOCAL_COMMANDS
+
+
 HELP = f"""
 {c('MCP_CLIENT_SEB', 'bold')} v{__version__} — commands:
 
@@ -113,6 +129,10 @@ HELP = f"""
                           connect it; -c gives it a config of MCP servers to
                           start with. Drive it via its <name>__ask tool.
   {c('/kill', 'cyan')} <name>         stop a spawned subagent and drop its tools
+  {c('/ask', 'cyan')} <path> <prompt>  send one prompt to a subagent, e.g.
+                          /ask worker/scout /tools — its output streams live
+  {c('/focus', 'cyan')} <path>        send every prompt to that subagent until
+                          {c('/unfocus', 'cyan')} (talk to it as if it were front)
   {c('/thinking', 'cyan')}            toggle showing Claude's reasoning summary
   {c('/reset', 'cyan')}               start a fresh chat conversation
   {c('/quit', 'cyan')}                exit (also: /exit, Ctrl-D)
@@ -144,6 +164,10 @@ class Repl:
         self._trace: list[str] = []           # back: tool activity of the current ask
         self._ask_ctx = None                  # back: MCP context of the current ask
         self._lock = asyncio.Lock()           # back: one ask at a time
+        self._stream: asyncio.Queue | None = None  # back: live output of the current ask
+        self._streamed = 0                    # lines received from subagents (see cmd_ask)
+        #: Front only: subagent path (``worker/scout``) the keyboard is redirected to.
+        self.focus: str | None = None
         self.agent: BaseAgent | None = None
         self.agent_error: str | None = None
         self.backend_label: str | None = None
@@ -165,17 +189,38 @@ class Repl:
         else:
             self.manager.permission_prompt = self._escalate_permission
             self.manager.elicit_handler = self._relay_elicitation
+        self.manager.output_handler = self._on_subagent_output
         self._init_agent()
 
     def out(self, text: str = "") -> None:
-        """Print in front. In back, stdout is the MCP pipe: collect into the
-        current ``ask``'s answer instead, or log if no ask is running."""
+        """Print in front. In back, stdout is the MCP pipe: the line goes into
+        the current ``ask``'s answer *and* streams live to the parent (see
+        :meth:`submit`) — or to the log if no ask is running."""
         if self.front:
             print(text)
         elif self._sink is not None:
             self._sink.append(text)
+            self._send_up(text)
         elif text.strip():
             logger.info(text)
+
+    def _send_up(self, text: str, path: list[str] | None = None) -> None:
+        """Back: queue one line for the parent's screen. ``path`` names the
+        nested subagent it came from, if it isn't ours."""
+        if self._stream is not None:
+            self._stream.put_nowait({"from": path or [], "text": text})
+
+    async def _on_subagent_output(self, server: str, data: dict) -> None:
+        """A subagent streamed a line. Front prints it under its path; back
+        relays it up, prepending the child's name."""
+        self._streamed += 1
+        path = [server, *data.get("from", [])]
+        if not self.front:
+            self._send_up(data["text"], path)
+            return
+        tag = c(f"  {'/'.join(path)} │ ", "cyan")
+        for line in str(data["text"]).splitlines() or [""]:
+            print(tag + line)
 
     def _init_agent(self) -> None:
         """Select a chat backend per --backend (or auto-detect)."""
@@ -271,9 +316,57 @@ class Repl:
         if not name:
             self.out(c("  Usage: /kill <name>", "yellow"))
             return
+        if self.focus and self.focus.split("/")[0] == name:
+            self.cmd_focus("")
         self.out(c(f"  → removing subagent {name!r} …", "dim"))
         content, is_error = await remove_subagent(self.manager, name)
         self.out(c(parts_to_text(content), "red" if is_error else "green"))
+
+    async def cmd_ask(self, arg: str) -> None:
+        """Send one prompt to a subagent, routed hop by hop along ``path``.
+
+        Each hop is the next agent's own ``/ask``, so ``worker/scout`` works at
+        any depth with no routing tables. Its output streams back live (see
+        :meth:`_on_subagent_output`); the returned answer is only printed if
+        nothing streamed, so it isn't shown twice.
+        """
+        path, _, prompt = arg.strip().partition(" ")
+        prompt = prompt.strip()
+        if not path or not prompt:
+            self.out(c("  Usage: /ask <subagent[/sub…]> <prompt>", "yellow"))
+            return
+        first, _, rest = path.strip("/").partition("/")
+        tool = f"{first}__ask"
+        if tool not in self.manager.tools:
+            self.out(c(f"  No subagent named {first!r} here (see /tools).", "red"))
+            return
+        if rest:
+            prompt = f"/ask {rest} {prompt}"
+        before = self._streamed
+        content, is_error = await self.manager.call_tool(tool, {"prompt": prompt})
+        text = parts_to_text(content)
+        if is_error or self._streamed == before:
+            self.out(c(text, "red") if is_error else text)
+        elif self._sink is not None:
+            # Already streamed to the human, but still this ask's answer.
+            self._sink.append(text)
+
+    def cmd_focus(self, arg: str) -> None:
+        path = arg.strip().strip("/")
+        if not self.front:
+            self.out("  /focus only applies to the front (the agent at the keyboard).")
+            return
+        if not path:
+            if self.focus:
+                self.out(c(f"  back to this agent (was focused on {self.focus}).", "dim"))
+            self.focus = None
+            return
+        first = path.split("/")[0]
+        if f"{first}__ask" not in self.manager.tools:
+            self.out(c(f"  No subagent named {first!r} here (see /tools).", "red"))
+            return
+        self.focus = path
+        self.out(c(f"  prompts now go to {path} — /unfocus to come back.", "dim"))
 
     async def cmd_chat(self, text: str) -> None:
         if self.agent is None:
@@ -362,6 +455,10 @@ class Repl:
         ctx = self._ask_ctx
         if ctx is None:
             return "no"
+        if self._stream is not None:
+            # Flush queued output first, so the front shows what led up to the
+            # request (e.g. "→ calling run_bash …") before asking about it.
+            await self._stream.join()
         try:
             result = await ctx.session.elicit_form(
                 message, PERMISSION_SCHEMA, related_request_id=ctx.request_id)
@@ -379,24 +476,30 @@ class Repl:
         elif kind == "tool_call":
             args = json.dumps(payload["input"])
             if not self.front:
-                # The parent's LLM wants an answer, not a log: keep tool activity
-                # out of it, as a fallback for when no text comes (see submit).
+                # The parent's LLM wants an answer, not a log: tool activity only
+                # streams to the human, and is kept as a fallback for when no
+                # text comes (see submit).
                 self._trace.append(f"[tool] {payload['name']}({args})")
-                return
-            self.out(c(f"  ⚙ {payload['name']}({args})", "dim", "cyan"))
+            self._activity(c(f"  ⚙ {payload['name']}({args})", "dim", "cyan"))
         elif kind == "tool_result":
-            if not self.front:
-                return
             preview = payload["text"].replace("\n", " ")
             if len(preview) > 160:
                 preview = preview[:160] + "…"
             tag = "error" if payload["is_error"] else "ok"
             style = "red" if payload["is_error"] else "dim"
-            self.out(c(f"    ↳ [{tag}] {preview}", style))
+            self._activity(c(f"    ↳ [{tag}] {preview}", style))
         elif kind == "error":
             # Backend/loop failures (bad request, refusal, iteration cap) arrive
             # here; without this branch they'd be silently swallowed.
             self.out(c(f"  ⚠ {payload}", "red"))
+
+    def _activity(self, text: str) -> None:
+        """A line for the human only: printed in front, streamed (but kept out
+        of the answer) in back."""
+        if self.front:
+            print(text)
+        else:
+            self._send_up(text)
 
     # -- loop --------------------------------------------------------------
 
@@ -412,7 +515,8 @@ class Repl:
 
         while True:
             try:
-                line = await asyncio.to_thread(input, c("mcp> ", "bold", "green"))
+                prompt = f"mcp:{self.focus}> " if self.focus else "mcp> "
+                line = await asyncio.to_thread(input, c(prompt, "bold", "green"))
             except (EOFError, KeyboardInterrupt):
                 self.out()
                 break
@@ -427,23 +531,45 @@ class Repl:
         """
         async with self._lock:
             self._sink, self._trace, self._ask_ctx = [], [], ctx
+            self._stream = asyncio.Queue()
+            pump = asyncio.create_task(self._pump(self._stream, ctx))
             try:
                 await self.handle(line)
                 answer = "\n".join(t for t in self._sink if t).strip()
                 trace = self._trace
             finally:
-                self._sink, self._ask_ctx = None, None
+                # Drain before answering: the parent then receives every live
+                # line before the result, so nothing prints after the answer.
+                self._stream.put_nowait(None)
+                await pump
+                self._sink, self._ask_ctx, self._stream = None, None, None
         if not answer:
             answer = "(subagent produced no text)"
             if trace:
                 answer += "\nTool activity:\n" + "\n".join(trace)
         return answer
 
+    @staticmethod
+    async def _pump(queue: asyncio.Queue, ctx) -> None:
+        """Send queued output lines to the parent, in order, as MCP log
+        notifications tied to the running ask. Display only: a failed send is
+        dropped, never allowed to fail the ask."""
+        while (item := await queue.get()) is not None:
+            try:
+                await ctx.session.send_log_message(
+                    "info", item, logger=OUTPUT_LOGGER, related_request_id=ctx.request_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("output line not delivered: %s", e)
+            finally:
+                queue.task_done()  # lets _escalate wait for the backlog
+
     async def handle(self, line: str) -> bool:
         """Run one prompt — keyboard or ``ask``, it's the same. Returns True to quit."""
         line = line.strip()
         if not line:
             return False
+        if self.focus and not _is_local(line):
+            line = f"/ask {self.focus} {line}"
         if line.startswith("/"):
             return await self._dispatch(line)
         await self.cmd_chat(line)
@@ -474,6 +600,12 @@ class Repl:
             await self.cmd_spawn(arg)
         elif cmd == "kill":
             await self.cmd_kill(arg)
+        elif cmd == "ask":
+            await self.cmd_ask(arg)
+        elif cmd == "focus":
+            self.cmd_focus(arg)
+        elif cmd == "unfocus":
+            self.cmd_focus("")
         elif cmd == "thinking":
             self.show_thinking = not self.show_thinking
             self.out(c(f"  show reasoning: {self.show_thinking}", "dim"))
