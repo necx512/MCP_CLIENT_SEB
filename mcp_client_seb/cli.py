@@ -316,7 +316,7 @@ class Repl:
             system_prompt=fields.get("system_prompt"),
             description=fields.get("description"),
             mcp_servers=fields.get("mcp_servers"),
-            require_permission=fields.get("require_permission"),
+            no_required_permission=fields.get("no_required_permission"),
             overwrite=bool(fields.get("overwrite", False)),
         )
         self.out(c(parts_to_text(content), "red" if is_error else "green"))
@@ -654,15 +654,18 @@ async def _amain(argv: list[str] | None = None) -> int:
              "dynamically via its connect_server tool).",
     )
     parser.add_argument(
-        "--backend", "-b", choices=["auto", "anthropic", "ollama", "vllm"], default="auto",
+        "--backend", "-b", choices=["auto", "anthropic", "ollama", "vllm", "copilot"],
+        default="auto",
         help="LLM backend for chat mode. 'auto' prefers Anthropic (if a key is "
-             "set), then a local Ollama, then a vLLM server (default: auto).",
+             "set), then a local Ollama, then a vLLM server (default: auto). "
+             "'copilot' (GitHub Copilot via its SDK) must be chosen explicitly.",
     )
     parser.add_argument(
         "--model", "-m", default=None,
-        help="Model to use for chat (Ollama and vLLM backends). Ollama defaults to "
-             "$OLLAMA_MODEL or 'llama3.1'; vLLM to $VLLM_MODEL or the first model "
-             "the server advertises. (The Anthropic model is fixed in its backend.)",
+        help="Model to use for chat (Ollama, vLLM and Copilot backends). Ollama defaults "
+             "to $OLLAMA_MODEL or 'llama3.1'; vLLM to $VLLM_MODEL or the first model "
+             "the server advertises; Copilot to $COPILOT_MODEL or 'claude-sonnet-5.5'. "
+             "(The Anthropic model is fixed in its backend.)",
     )
     parser.add_argument(
         "--ollama-host", default=None,
@@ -749,12 +752,16 @@ async def _amain(argv: list[str] | None = None) -> int:
                     think=think, keep_alive=args.ollama_keep_alive,
                     system_prompt=client_cfg.system_prompt,
                     spawn_settings=spawn_settings)
-        if front:
-            await repl.run()
-        else:
-            # Back: no stdout chatter — the MCP protocol owns stdout.
-            from .server import serve  # noqa: PLC0415 — pulls in FastMCP only when serving
-            await serve(repl, client_cfg)
+        try:
+            if front:
+                await repl.run()
+            else:
+                # Back: no stdout chatter — the MCP protocol owns stdout.
+                from .server import serve  # noqa: PLC0415 — pulls in FastMCP only when serving
+                await serve(repl, client_cfg)
+        finally:
+            if repl.agent is not None:
+                await repl.agent.aclose()
     if front:
         print(c("bye.", "dim"))
     return 0

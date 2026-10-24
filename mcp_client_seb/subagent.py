@@ -7,7 +7,7 @@ other MCP server — but it is never listed in ``servers.json``; it is wired up
 dynamically at runtime via :meth:`MCPManager.connect`.
 
 A subagent is defined **only by its config file** (``systemPrompt``,
-``description``, ``mcpServers``, ``requirePermission``): spawning takes a name
+``description``, ``mcpServers``, ``noRequiredPermission``): spawning takes a name
 and a config path, nothing else. Two functions are shared by the ``/mkconfig``
 and ``/spawn`` REPL commands and by the LLM's local tools of the same purpose:
 
@@ -61,8 +61,9 @@ CONFIG_TOOL_SCHEMA = {
                            "the mcpServers shape: {\"<name>\": {\"command\": \"...\", "
                            "\"args\": [...], \"env\": {...}, \"cwd\": \"...\"}}.",
         },
-        "require_permission": {
-            "description": "Tools needing human approval: true (all) or a list of tool names.",
+        "no_required_permission": {
+            "description": "Tools exempt from human approval (every other tool needs "
+                           "it): true (all) or a list of tool names.",
             "anyOf": [{"type": "boolean"}, {"type": "array", "items": {"type": "string"}}],
         },
         "overwrite": {
@@ -150,7 +151,7 @@ def create_agent_config(
     system_prompt: str | None = None,
     description: str | None = None,
     mcp_servers: dict[str, Any] | None = None,
-    require_permission: bool | list[str] | None = None,
+    no_required_permission: bool | list[str] | None = None,
     overwrite: bool = False,
 ) -> tuple[list[dict[str, str]], bool]:
     """Write a subagent config file. Returns ``(content_parts, is_error)``.
@@ -172,8 +173,8 @@ def create_agent_config(
         data["description"] = description
     if system_prompt:
         data["systemPrompt"] = system_prompt
-    if require_permission is not None:
-        data["requirePermission"] = require_permission
+    if no_required_permission is not None:
+        data["noRequiredPermission"] = no_required_permission
     data["mcpServers"] = mcp_servers or {}
 
     existed = target.exists()
@@ -268,7 +269,7 @@ def install_spawn_tool(manager: MCPManager, settings: SpawnSettings) -> None:
             system_prompt=args.get("system_prompt"),
             description=args.get("description"),
             mcp_servers=args.get("mcp_servers"),
-            require_permission=args.get("require_permission"),
+            no_required_permission=args.get("no_required_permission"),
             overwrite=bool(args.get("overwrite", False)),
         )
 

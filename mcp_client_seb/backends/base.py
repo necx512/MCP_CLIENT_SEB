@@ -236,6 +236,9 @@ class BaseAgent(ABC):
         """Start a fresh conversation."""
         self._messages = self._initial_messages()
 
+    async def aclose(self) -> None:
+        """Release backend resources at exit (e.g. a runtime process). Default: none."""
+
     # -- the loop (shared across every backend) ----------------------------
 
     async def send(self, user_text: str, on_event) -> None:

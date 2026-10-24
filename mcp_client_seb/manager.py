@@ -70,9 +70,10 @@ class ToolRef:
     input_schema: dict[str, Any]
     handler: LocalHandler | None = None  # set for local tools; dispatched in-process
     #: Resolved at registration: does calling this tool need human approval? True
-    #: if the server declared it (tool ``_meta``/annotations) OR the client's
-    #: config asks for it. Enforced in :meth:`MCPManager.call_tool`.
-    requires_permission: bool = False
+    #: unless the client's config exempts it (``noRequiredPermission``) and the
+    #: server doesn't declare it (tool ``_meta``/annotations). Enforced in
+    #: :meth:`MCPManager.call_tool`.
+    requires_permission: bool = True
 
 
 class MCPManager:
@@ -253,25 +254,26 @@ class MCPManager:
 
     def _resolve_permission(self, server: str | None, exposed: str,
                             original: str, server_declared: bool) -> bool:
-        """Does this tool need approval? server-declared OR any client-side rule.
+        """Does this tool need approval? Yes, unless the client exempts it.
 
-        The OR is the whole point: if *either* the server or the client asks for
-        permission, we ask. A tool is gated unless *both* sides stay silent.
+        Gated by default: a tool runs unasked only when a client-side
+        ``noRequiredPermission`` rule exempts it. A server-declared requirement
+        can't be exempted — the server's caution always wins.
         """
         if server_declared:
             return True
         perms = self._permissions
-        if perms.all_tools:                                   # global: gate all
-            return True
+        if perms.all_tools:                                   # global: exempt all
+            return False
         if exposed in perms.tools or original in perms.tools:  # global: named
-            return True
+            return False
         cfg = self._servers.get(server) if server else None
-        rp = getattr(cfg, "require_permission", False) if cfg else False
-        if rp is True:                                        # per-server: all
-            return True
-        if isinstance(rp, set) and (original in rp or exposed in rp):  # per-server: named
-            return True
-        return False
+        nrp = getattr(cfg, "no_required_permission", False) if cfg else False
+        if nrp is True:                                       # per-server: all
+            return False
+        if isinstance(nrp, set) and (original in nrp or exposed in nrp):  # per-server: named
+            return False
+        return True
 
     async def disconnect(self, name: str) -> list[str]:
         """Tear down one server connection: stop its process and drop its tools.

@@ -21,7 +21,7 @@ It comes pre-wired to the **`re-assistant`** reverse-engineering MCP server in
 2. [Install](#2-install)
 3. [Configure your servers](#3-configure-your-servers)
 4. [The two modes](#4-the-two-modes)
-5. [Choosing a chat backend (Claude or Ollama)](#5-choosing-a-chat-backend-claude-or-ollama)
+5. [Choosing a chat backend (Claude, Ollama, vLLM or Copilot)](#5-choosing-a-chat-backend-claude-ollama-vllm-or-copilot)
 6. [Command reference](#6-command-reference)
 7. [Walkthrough: manual mode](#7-walkthrough-manual-mode)
 8. [Walkthrough: chat mode](#8-walkthrough-chat-mode)
@@ -91,7 +91,7 @@ ollama pull llama3.1         # or qwen2.5, qwen3, mistral-nemo, llama3.2 …
 python3 -m mcp_client_seb --backend ollama --model llama3.1
 ```
 
-See [§5](#5-choosing-a-chat-backend-claude-or-ollama) for how backends are
+See [§5](#5-choosing-a-chat-backend-claude-ollama-vllm-or-copilot) for how backends are
 chosen. If no backend is available, the client still starts — manual `/call`
 access keeps working.
 
@@ -145,7 +145,7 @@ Ollama); if none is available, chat is disabled but manual commands keep working
 
 ---
 
-## 5. Choosing a chat backend (Claude or Ollama)
+## 5. Choosing a chat backend (Claude, Ollama, vLLM or Copilot)
 
 Chat mode can be powered by either backend. Pick with `--backend`:
 
@@ -201,9 +201,40 @@ with a message (and manual `/call` still works).
 > **Note:** local models are generally weaker at multi-step tool use than Claude.
 > For a demanding RE workflow, expect to guide them more, or use a larger model.
 
+### Using GitHub Copilot
+
+`--backend copilot` uses your **GitHub Copilot subscription** through the
+official Copilot SDK. It's never picked by `auto`; choose it explicitly.
+
+```bash
+pip install github-copilot-sdk
+export COPILOT_GITHUB_TOKEN=github_pat_...   # or: copilot → /login
+./run.sh --backend copilot --model claude-sonnet-5.5
+```
+
+- **Auth:** a fine-grained PAT (resource owner = your personal account,
+  *Account* permission **Copilot Requests**) in `$COPILOT_GITHUB_TOKEN`
+  (or `$GH_TOKEN` / `$GITHUB_TOKEN`), else the login stored by Copilot CLI.
+  Classic `ghp_` tokens are refused. Subagents inherit the variable.
+- **Model:** `--model` / `$COPILOT_MODEL`, default `claude-sonnet-5.5`. The
+  models your seat can use depend on your plan and organization policy.
+- **Only your tools:** Copilot's own built-in tools (shell, file edits, its
+  GitHub MCP server) are disabled. The model can only call the tools in
+  `/tools`, and every call goes through the [permission check](#14-tool-permissions-approve-before-running).
+- **Differences from the other backends:** the Copilot runtime runs the
+  tool-use loop itself and replaces Copilot's system prompt with yours. A turn
+  is aborted after 1 hour.
+- **Interceptor:** when `llm_interceptor` is installed, the runtime's model
+  calls are routed through this client, and all four points work. `request`
+  and `response` show the **provider's own wire format** as
+  `{"url", "body"}` / `{"status", "events"}`: Anthropic Messages for
+  Claude, OpenAI for GPT. A streamed (SSE) response is shown as a list of
+  events, and editing one rewrites the stream. Dropping returns an HTTP 400
+  to the runtime, which ends the turn.
+
 ### Which backend for which model?
 
-- `--model` sets the **Ollama** model only.
+- `--model` sets the **Ollama**, **vLLM** and **Copilot** model.
 - The **Claude** model is `claude-opus-4-8`, set in
   `mcp_client_seb/backends/anthropic_backend.py` (change `MODEL` there).
 
@@ -284,7 +315,7 @@ Tools that take no arguments can be called bare: `/call backend_status`.
 
 ## 8. Walkthrough: chat mode
 
-Once a backend is active (Claude or Ollama — see [§5](#5-choosing-a-chat-backend-claude-or-ollama)),
+Once a backend is active (Claude or Ollama — see [§5](#5-choosing-a-chat-backend-claude-ollama-vllm-or-copilot)),
 just describe what you want. The model picks the tools, runs them, and explains
 the result. The flow is identical regardless of backend:
 
@@ -355,7 +386,7 @@ names instead of bare ones.
 | `args` | — | List of arguments. |
 | `cwd` | — | Working directory for the server process. |
 | `env` | — | Extra env vars (layered on top of your current environment). |
-| `requirePermission` | — | Gate this server's tools behind human approval: `true` (all), `false`/omitted (none), or a list of tool names. See [§14](#14-tool-permissions-approve-before-running). |
+| `noRequiredPermission` | — | Exempt this server's tools from human approval (every tool needs it by default): `true` (all), `false`/omitted (none), or a list of tool names. See [§14](#14-tool-permissions-approve-before-running). |
 | `prefix` | — | Namespace this server's tools as `<prefix>__<tool>`. Opt-in; most servers keep bare names. Use it to disambiguate a statically-configured subagent (`"prefix": "scout"` → `scout__ask`) or two servers sharing tool names. |
 
 **Command-line flags:**
@@ -521,7 +552,7 @@ Once connected as `worker`, these appear in the parent's tool namespace:
 | `worker__reset()` | Start the subagent on a fresh conversation. |
 
 A subagent is defined **only by its config file** — `systemPrompt`,
-`description`, `mcpServers`, `requirePermission`. Spawning takes a name and a
+`description`, `mcpServers`, `noRequiredPermission`. Spawning takes a name and a
 config path, nothing else; to change a subagent, edit (or regenerate) its config
 and respawn it.
 
@@ -552,7 +583,7 @@ so both paths behave identically:
 
 | Function | REPL command | LLM tool |
 |---|---|---|
-| `create_agent_config(path, system_prompt, description, mcp_servers, require_permission, overwrite)` | `/mkconfig <path> [json]` | `create_agent_config` |
+| `create_agent_config(path, system_prompt, description, mcp_servers, no_required_permission, overwrite)` | `/mkconfig <path> [json]` | `create_agent_config` |
 | `spawn_subagent(manager, name, settings, config)` | `/spawn <name> <config.json>` | `spawn_subagent` |
 
 `create_agent_config` refuses to replace an existing file unless `overwrite` is
@@ -603,54 +634,53 @@ servers.
 ## 14. Tool permissions (approve before running)
 
 Some tools shouldn't run unattended — running a shell command, deleting a file,
-posting to an API. This client can **pause and ask you** before it executes such
-a tool, whether the call came from the LLM in chat mode or from a manual
-`/call`. The gate is generic: it works for **every tool on every MCP server**,
-not just ones written for this client.
+posting to an API. This client **pauses and asks you** before it executes a
+tool, whether the call came from the LLM in chat mode or from a manual `/call`.
+The gate is generic: it works for **every tool on every MCP server**, not just
+ones written for this client — including the built-in `create_agent_config`,
+`spawn_subagent` and `remove_subagent` tools, and a subagent's own tools
+(`worker__ask`, `worker__connect_server`, …).
 
-### Two places decide — and they OR together
+### Every tool is gated by default (whitelist)
 
-Whether a given tool needs approval is decided by **two independent sources**:
+A tool runs without prompting **only when your config exempts it** with
+`noRequiredPermission` — and the server doesn't declare it as needing
+permission. A server-declared requirement (see below) can't be exempted: the
+server's caution always wins.
 
-1. **The MCP server** that owns the tool can declare it needs permission, in its
-   tool metadata (see below).
-2. **This client's config file** can require it, per-server or globally.
+### Exempting tools in the client (`servers.json`)
 
-The rule is a logical **OR**: if *either* side asks for permission, you are
-asked. A tool runs without prompting **only when both sides stay silent**. So a
-cautious server is honoured even if your config says nothing, and a cautious
-config is honoured even for a server that declares nothing.
-
-### Configuring it in the client (`servers.json`)
-
-**Per server** — add `requirePermission` inside a server's entry:
+**Per server** — add `noRequiredPermission` inside a server's entry:
 
 ```json
 {
   "mcpServers": {
-    "bash":  { "command": "python3", "args": ["bash_server.py"],
-               "requirePermission": true },
-    "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-               "requirePermission": ["write_file", "move_file"] }
+    "re-assistant": { "command": "python3", "args": ["-m", "src.server"],
+                      "noRequiredPermission": ["file_info", "list_functions"] },
+    "docs":         { "command": "npx", "args": ["-y", "some-readonly-server"],
+                      "noRequiredPermission": true }
   }
 }
 ```
 
-- `true` — every tool from this server needs approval.
-- `false` / omitted — this server adds no client-side requirement (the server's
-  own declaration can still trigger it).
-- `["a", "b"]` — only those tools (by their un-namespaced name) need approval.
+- `true` — no tool from this server needs approval (except server-declared ones).
+- `false` / omitted — every tool from this server needs approval.
+- `["a", "b"]` — only those tools (by their un-namespaced name) run unasked.
 
-**Globally** — a top-level `requirePermission` applies across *all* servers:
+**Globally** — a top-level `noRequiredPermission` applies across *all* servers
+and to the built-in local tools:
 
 ```json
 {
-  "requirePermission": true,                 // ask before every tool, everywhere
+  "noRequiredPermission": ["ask", "list_tools"],   // e.g. delegate to subagents unasked
   "mcpServers": { ... }
 }
 ```
 
-or a list of tool names: `"requirePermission": ["run_bash", "delete_user"]`.
+or `true` to exempt every tool everywhere (the old opt-in behaviour).
+
+The former `requirePermission` key is rejected with an error, since its meaning
+was the inverse.
 
 ### Configuring it in the server
 

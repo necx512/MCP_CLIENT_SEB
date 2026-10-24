@@ -7,6 +7,10 @@ mcp>=1.0.0,<2
 # Manual /call tool access works without it.
 anthropic>=0.49.0
 
+# Optional — only needed for the GitHub Copilot backend (--backend copilot).
+# Needs a Copilot subscription; auth via $COPILOT_GITHUB_TOKEN or `copilot` /login.
+#github-copilot-sdk>=1.0.26
+
 # Optional — Burp-style interception of the agent<->LLM conversation.
 # A separate project and a separate tool; this client works unchanged without
 # it. Install with:  pip install --user -e ../INTERCEPTOR

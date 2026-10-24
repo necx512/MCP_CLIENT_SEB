@@ -5,15 +5,7 @@
     "re-assistant": {
       "command": "python3",
       "args": ["-m", "src.server"],
-      "cwd": "/home/debian/IA/mcpreverse/mcp-re-assistant",
-      "requirePermission": [
-        "debug_run",
-        "write_memory",
-        "frida_attach",
-        "frida_resume",
-        "frida_script",
-        "frida_trace"
-      ]
+      "cwd": "/home/debian/IA/mcpreverse/mcp-re-assistant"
     }
   }
 }

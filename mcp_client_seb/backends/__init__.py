@@ -11,6 +11,7 @@ from __future__ import annotations
 from ..manager import MCPManager
 from .anthropic_backend import AnthropicAgent
 from .base import BackendError, BackendUnavailable, BaseAgent, ChatSettings
+from .copilot_backend import CopilotAgent
 from .ollama_backend import OllamaAgent
 from .vllm_backend import VLLMAgent
 
@@ -19,15 +20,18 @@ BACKENDS: dict[str, type[BaseAgent]] = {
     "anthropic": AnthropicAgent,
     "ollama": OllamaAgent,
     "vllm": VLLMAgent,
+    "copilot": CopilotAgent,
 }
 
-#: Order tried when backend == "auto".
+#: Order tried when backend == "auto". Copilot is left out: its auth can only be
+#: checked by starting its runtime, so it must be chosen explicitly.
 AUTO_ORDER: list[str] = ["anthropic", "ollama", "vllm"]
 
 __all__ = [
     "AnthropicAgent",
     "OllamaAgent",
     "VLLMAgent",
+    "CopilotAgent",
     "BaseAgent",
     "ChatSettings",
     "BackendError",
@@ -39,7 +43,7 @@ __all__ = [
 
 
 def build_agent(backend: str, manager: MCPManager, settings: ChatSettings) -> BaseAgent:
-    """Return a ready agent for ``backend`` ("auto"/"anthropic"/"ollama").
+    """Return a ready agent for ``backend`` ("auto"/"anthropic"/"ollama"/"vllm"/"copilot").
 
     Raises :class:`BackendUnavailable` with a combined message if none work.
     """
